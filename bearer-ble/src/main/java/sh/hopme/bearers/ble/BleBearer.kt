@@ -533,10 +533,22 @@ internal class Central(
         gattByAddr[addr] = g
         main.postDelayed({
             if (addr in inFlight) {
-                Log.w(TAG, "DIAL TIMEOUT addr=$addr → closing GATT")
+                // A stuck dial is most often service-discovery that never completes: an iOS peer
+                // rotated its random MAC or re-published its GATT server, and Android's cached
+                // (now-empty) service list makes discoverServices() return nothing forever — the
+                // 6-minute pixel→xr wedge. refresh() drops that cache so the next dial re-reads.
+                Log.w(TAG, "DIAL TIMEOUT addr=$addr → refresh cache + closing GATT")
+                refreshGattCache(g)
                 g.close(); gattByAddr.remove(addr); fail(addr)
             }
         }, DIAL_TIMEOUT_MS) // R6
+    }
+
+    /// Clear Android's cached GATT service list for this connection via the hidden
+    /// `BluetoothGatt.refresh()` (reflection). Best-effort: invalidates a stale/empty cache so the
+    /// next `discoverServices()` against the same device re-reads its services from scratch.
+    private fun refreshGattCache(g: BluetoothGatt) {
+        runCatching { g.javaClass.getMethod("refresh").invoke(g) }
     }
 
     private val gattCb = object : BluetoothGattCallback() {
