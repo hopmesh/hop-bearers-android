@@ -4,7 +4,7 @@ plugins {
 }
 // bearer-relay — an INDEPENDENT Android bearer library depending only on the Kotlin SDK (sh.hop).
 android {
-    namespace = "net.waldrip.hop.bearers.relay"
+    namespace = "sh.hopme.bearers.relay"
     compileSdk = 34
     defaultConfig { minSdk = 29 }
     compileOptions {

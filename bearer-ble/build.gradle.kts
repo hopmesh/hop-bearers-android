@@ -4,7 +4,7 @@ plugins {
 }
 // bearer-ble — an INDEPENDENT Android bearer library depending only on the Kotlin SDK (sh.hop).
 android {
-    namespace = "net.waldrip.hop.bearers.ble"
+    namespace = "sh.hopme.bearers.ble"
     compileSdk = 34
     defaultConfig { minSdk = 29 }
     compileOptions {

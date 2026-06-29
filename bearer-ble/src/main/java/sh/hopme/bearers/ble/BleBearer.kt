@@ -1,4 +1,4 @@
-package net.waldrip.hop.bearers.ble
+package sh.hopme.bearers.ble
 
 import sh.hop.Bearer
 import sh.hop.LinkId

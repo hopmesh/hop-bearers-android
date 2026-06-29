@@ -1,4 +1,4 @@
-package net.waldrip.hop.bearers.wifidirect
+package sh.hopme.bearers.wifidirect
 
 import android.Manifest
 import android.content.BroadcastReceiver

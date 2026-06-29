@@ -1,4 +1,4 @@
-package net.waldrip.hop.bearers.lan
+package sh.hopme.bearers.lan
 
 import android.content.Context
 import android.net.nsd.NsdManager

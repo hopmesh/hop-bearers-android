@@ -1,4 +1,4 @@
-package net.waldrip.hop.bearers.relay
+package sh.hopme.bearers.relay
 
 import android.util.Log
 import sh.hop.Bearer

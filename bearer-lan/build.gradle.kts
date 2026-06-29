@@ -5,7 +5,7 @@ plugins {
 // bearer-lan — the LAN transport (NSD + TCP) as a fully INDEPENDENT Android library depending only on
 // the Kotlin SDK (sh.hop). The Android mirror of bearers/apple/HopBearerLan.
 android {
-    namespace = "net.waldrip.hop.bearers.lan"
+    namespace = "sh.hopme.bearers.lan"
     compileSdk = 34
     defaultConfig { minSdk = 29 }
     compileOptions {

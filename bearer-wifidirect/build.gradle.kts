@@ -4,7 +4,7 @@ plugins {
 }
 // bearer-wifidirect — an INDEPENDENT Android bearer library depending only on the Kotlin SDK (sh.hop).
 android {
-    namespace = "net.waldrip.hop.bearers.wifidirect"
+    namespace = "sh.hopme.bearers.wifidirect"
     compileSdk = 34
     defaultConfig { minSdk = 29 }
     compileOptions {
