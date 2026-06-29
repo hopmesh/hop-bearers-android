@@ -8,5 +8,6 @@ plugins {
 sourceSets["main"].java.srcDir("../../../sdk/wrappers/kotlin/src/main/kotlin")
 kotlin { jvmToolchain(17) }
 dependencies {
-    api("net.java.dev.jna:jna:5.14.0")
+    // JNA is provided by the app (as the Android @aar, for UniFFI); compileOnly avoids a jar+aar clash.
+    compileOnly("net.java.dev.jna:jna:5.14.0")
 }
