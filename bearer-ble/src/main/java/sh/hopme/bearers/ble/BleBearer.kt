@@ -28,7 +28,11 @@ import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.annotation.SuppressLint
+import android.bluetooth.BluetoothAdapter
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelUuid
@@ -67,10 +71,12 @@ internal val ENDPOINT_CHAR: UUID = UUID.fromString("7ED70002-3C2A-4F19-9B8E-1A2B
 internal const val MFG_ID = 0xFFFF
 
 // iBeacon (Layer C) — the iOS *relaunch* signal. Byte-matches iOS BeaconWake.swift BEACON_UUID.
-internal val BEACON_UUID: UUID = UUID.fromString("7ED7BEAC-3C2A-4F19-9B8E-1A2B3C4D5E6F") // == iOS BEACON_UUID
+// Public so the app driver references THIS single value instead of redefining the literal (F-40).
+val BEACON_UUID: UUID = UUID.fromString("7ED7BEAC-3C2A-4F19-9B8E-1A2B3C4D5E6F") // == iOS BEACON_UUID
 internal const val APPLE_COMPANY_ID = 0x004C
 internal const val BEACON_CYCLE_MS = 300_000L   // ~5 min: floor for CoreLocation relaunch rate-limit
 internal const val BEACON_EXIT_GAP_MS = 35_000L // > iOS ~30 s exit-debounce, so stop→start makes a clean enter
+internal const val HEAL_INTERVAL_S = 30L        // F-12: peripheral self-heal cadence (re-arm listener/advertiser)
 
 internal fun iBeaconPayload(uuid: UUID, major: Int, minor: Int, measuredPowerDbm: Int): ByteArray {
     val b = java.nio.ByteBuffer.allocate(23)          // ByteBuffer is big-endian by default
@@ -297,6 +303,9 @@ internal class Peripheral(
 
     private var beaconSet: AdvertisingSet? = null
     private val beaconSched = Executors.newSingleThreadScheduledExecutor()
+
+    @Volatile
+    private var stopped = false
     private val beaconCb = object : AdvertisingSetCallback() {
         override fun onAdvertisingSetStarted(set: AdvertisingSet?, txPower: Int, status: Int) {
             beaconSet = set; Log.i(TAG, "BEACON started status=$status txPower=$txPower")
@@ -307,12 +316,31 @@ internal class Peripheral(
     }
 
     fun start() {
-        val s = adapter.listenUsingInsecureL2capChannel() // INSECURE LE CoC, no bonding
+        stopped = false
+        openServer()
+        startGattServer() // R10: advertise only from onServiceAdded
+        startBeacon()
+        startBeaconCycler()
+        startSelfHeal()   // F-12: re-arm listener/advertiser/beacon if any of them drops
+    }
+
+    // F-10: opening the L2CAP listener can throw (BT off at launch, transient adapter error). Guard it
+    // so it never propagates out of start() and aborts the other bearers; the self-heal loop / BT-on
+    // event re-opens. Runs the accept loop; if the socket dies while we're still up, drop it so
+    // self-heal re-opens instead of the loop breaking permanently.
+    private fun openServer() {
+        if (stopped || server != null) return
+        val s = try {
+            adapter.listenUsingInsecureL2capChannel() // INSECURE LE CoC, no bonding
+        } catch (e: Exception) {
+            Log.w(TAG, "PERIPHERAL listen failed (${e.message}) — self-heal will retry")
+            return
+        }
         server = s
         psm = s.psm
         Log.i(TAG, "PERIPHERAL listening psm=$psm myId=${myId.toHex().take(8)}")
         thread(name = "l2cap-accept") {
-            while (true) {
+            while (!stopped) {
                 val sock = try {
                     s.accept()
                 } catch (e: IOException) {
@@ -322,13 +350,29 @@ internal class Peripheral(
                 Log.i(TAG, "ACCEPTED inbound L2CAP — wrapping link (reaper armed)")
                 Link(sock, mintLinkId(), isDialer = false, myId, onLink, onData, onClose).start()
             }
+            if (!stopped && server === s) { server = null } // let self-heal re-open a dead listener
         }
-        startGattServer() // R10: advertise only from onServiceAdded
-        startBeacon()
-        startBeaconCycler()
+    }
+
+    // F-12: periodic self-heal (SPEC §7.1). Nothing else re-arms a wedged/stopped advertiser or a
+    // dead listener once running; onServiceAdded only fires once. While BT is on, re-open the server
+    // if it died and (idempotently) re-arm the advertiser + beacon.
+    private fun startSelfHeal() {
+        beaconSched.scheduleAtFixedRate({
+            if (stopped) return@scheduleAtFixedRate
+            try {
+                if (adapter.isEnabled) {
+                    if (server == null) openServer()
+                    startAdvertise()
+                    startBeacon()
+                }
+            } catch (_: Exception) {}
+        }, HEAL_INTERVAL_S, HEAL_INTERVAL_S, TimeUnit.SECONDS)
     }
 
     fun stop() {
+        stopped = true
+        beaconSched.shutdownNow() // F-12: also stops the beacon cycler + self-heal (was leaking)
         try { gattServer?.close() } catch (_: Exception) {}
         gattServer = null
         try { server?.close() } catch (_: Exception) {}
@@ -681,6 +725,7 @@ class BleBearer(private val ctx: Context, private val myId: ByteArray) : Bearer 
     private var central: Central? = null
     private var peripheral: Peripheral? = null
     private var statusExec: ScheduledExecutorService? = null
+    private var btReceiver: BroadcastReceiver? = null   // F-10: watch BluetoothAdapter on/off
 
     // DIAG toggles via `adb shell setprop`:
     //   debug.blelab.noscan 1  → peripheral-only (don't scan/dial) — isolates scan-vs-peripheral starvation
@@ -688,28 +733,29 @@ class BleBearer(private val ctx: Context, private val myId: ByteArray) : Bearer 
 
     override fun start() {
         Log.i(TAG, "NODE START myId=${myId.toHex()} — ${if (noScan) "PERIPHERAL-ONLY (noscan)" else "symmetric dual role (peripheral + central)"}")
-        peripheral = Peripheral(
-            ctx, myId,
-            mintLinkId = { mint() },
-            onLink = { onUp(it) },
-            onData = { l, b -> onData(l, b) },
-            onClose = { onClose(it) },
-        )
-        central = Central(
-            ctx, myId,
-            mintLinkId = { mint() },
-            onLink = { onUp(it) },
-            onData = { l, b -> onData(l, b) },
-            onClose = { onClose(it) },
-            haveLinkTo = { synchronized(lock) { linksByPeerId.containsKey(it.toHex()) } },
-            haveLinkToPrefix = { pre ->
-                synchronized(lock) {
-                    val h = pre.toHex(); linksByPeerId.keys.any { it.startsWith(h) }
+        // F-10: recover from a Bluetooth adapter toggle (airplane mode, battery saver, the user, or a
+        // stack reset). The shared BleBearer previously had ZERO adapter-state handling, so a toggle
+        // left the device permanently deaf on BLE until the app was force-stopped. Watch STATE_OFF/ON
+        // and tear down / bring the radios back up.
+        val recv = object : BroadcastReceiver() {
+            override fun onReceive(c: Context?, intent: Intent?) {
+                when (intent?.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
+                    BluetoothAdapter.STATE_ON -> {
+                        Log.i(TAG, "BT STATE_ON — bringing radios up")
+                        bringUpRadios()
+                    }
+                    BluetoothAdapter.STATE_OFF, BluetoothAdapter.STATE_TURNING_OFF -> {
+                        Log.i(TAG, "BT STATE_OFF — tearing radios down")
+                        tearDownRadios()
+                    }
                 }
-            },
-        )
-        peripheral?.start()
-        if (!noScan) central?.start() else Log.i(TAG, "central scan/dial SUPPRESSED (debug.blelab.noscan=1)")
+            }
+        }
+        ctx.registerReceiver(recv, IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED))
+        btReceiver = recv
+
+        bringUpRadios()
+
         val ex = Executors.newSingleThreadScheduledExecutor()
         ex.scheduleAtFixedRate(
             { synchronized(lock) { Log.i(TAG, "STATUS links=${linksByPeerId.size}") } },
@@ -718,11 +764,56 @@ class BleBearer(private val ctx: Context, private val myId: ByteArray) : Bearer 
         statusExec = ex
     }
 
-    override fun stop() { // SPEC R11: STATE_OFF / teardown
-        statusExec?.shutdownNow(); statusExec = null
+    /// Create + start the peripheral and central. Idempotent-ish: a no-op if already up. Each start
+    /// is isolated so one radio failing (e.g. BT momentarily unavailable) can't abort the other (F-10).
+    private fun bringUpRadios() {
+        synchronized(lock) {
+            if (peripheral != null || central != null) return
+            peripheral = Peripheral(
+                ctx, myId,
+                mintLinkId = { mint() },
+                onLink = { onUp(it) },
+                onData = { l, b -> onData(l, b) },
+                onClose = { onClose(it) },
+            )
+            central = Central(
+                ctx, myId,
+                mintLinkId = { mint() },
+                onLink = { onUp(it) },
+                onData = { l, b -> onData(l, b) },
+                onClose = { onClose(it) },
+                haveLinkTo = { synchronized(lock) { linksByPeerId.containsKey(it.toHex()) } },
+                haveLinkToPrefix = { pre ->
+                    synchronized(lock) {
+                        val h = pre.toHex(); linksByPeerId.keys.any { it.startsWith(h) }
+                    }
+                },
+            )
+        }
+        try { peripheral?.start() } catch (e: Exception) { Log.w(TAG, "peripheral start failed: ${e.message}") }
+        if (!noScan) {
+            try { central?.start() } catch (e: Exception) { Log.w(TAG, "central start failed: ${e.message}") }
+        } else {
+            Log.i(TAG, "central scan/dial SUPPRESSED (debug.blelab.noscan=1)")
+        }
+    }
+
+    private fun tearDownRadios() {
         closeAll()
-        central?.stop(); central = null
-        peripheral?.stop(); peripheral = null
+        val (c, p) = synchronized(lock) {
+            val c = central; val p = peripheral
+            central = null; peripheral = null
+            c to p
+        }
+        try { c?.stop() } catch (_: Exception) {}
+        try { p?.stop() } catch (_: Exception) {}
+    }
+
+    override fun stop() { // SPEC R11: STATE_OFF / teardown
+        btReceiver?.let { try { ctx.unregisterReceiver(it) } catch (_: Exception) {} }
+        btReceiver = null
+        statusExec?.shutdownNow(); statusExec = null
+        tearDownRadios()
     }
 
     override fun send(bytes: ByteArray, link: LinkId) {

@@ -52,6 +52,7 @@ private const val LAN_DEAD_MS = 15_000L   // TCP is reliable; a generous livenes
 private const val LAN_REAP_MS = 5_000L    // close a connection that never completes HELLO
 private const val LAN_MAX_FRAME = 4 * 1024 * 1024
 private const val LAN_DIAL_TIMEOUT_MS = 5_000
+private const val LAN_RETRY_S = 5L   // F-14: rescan cadence to re-dial peers lost to a transient failure
 
 // Wire frame types — byte-identical to apple/HopBearers' LanBearer and to :bearer-ble's framing.
 private const val L_HELLO = 0x01
@@ -212,24 +213,59 @@ class LanBearer(private val ctx: Context, private val myId: ByteArray) : Bearer 
     private val resolveQueue = ArrayDeque<NsdServiceInfo>()
     private var resolving = false
 
+    // F-14: discovery is one-shot, so a transient resolve/dial failure used to silently forfeit a peer
+    // until mDNS re-announced (which may not happen for a long time). Remember the last-seen service per
+    // peer and periodically re-attempt any known-but-unlinked one — the BLE central re-dials on every
+    // advert; LAN gets the same pressure here. With Wi-Fi Direct gone, LAN is the only Wi-Fi transport.
+    private val knownServices = HashMap<String, NsdServiceInfo>()
+    private val retryExec: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
+
+    @Volatile
+    private var stopped = false
+
     @Volatile
     private var port = 0
 
     private val myHex = myId.toHex()
 
     override fun start() {
+        stopped = false
         Log.i(TAG, "lan node-start myId=$myHex service=$LAN_SERVICE_TYPE")
         thread(name = "lan-start") { startListener(); startNsd() }
+        retryExec.scheduleAtFixedRate({ runCatching { rescan() } }, LAN_RETRY_S, LAN_RETRY_S, TimeUnit.SECONDS)
     }
 
     override fun stop() {
+        stopped = true
+        retryExec.shutdownNow()
         val n = nsd
         regListener?.let { runCatching { n?.unregisterService(it) } }; regListener = null
         discListener?.let { runCatching { n?.stopServiceDiscovery(it) } }; discListener = null
         nsd = null
         runCatching { server?.close() }; server = null
+        synchronized(lock) { knownServices.clear() }
         val all = synchronized(lock) { linksByPeerId.values.toList() }
         all.forEach { it.close("stop") }
+    }
+
+    // F-14: re-dial any peer we've seen but aren't linked to / already dialing. Covers a peer lost to a
+    // transient resolve or connect failure (both of which just cleared `dialing` with no retry).
+    private fun rescan() {
+        if (stopped) return
+        val toResolve = ArrayList<NsdServiceInfo>()
+        synchronized(lock) {
+            for ((peerHex, svc) in knownServices) {
+                if (linksByPeerId.containsKey(peerHex) || dialing.contains(peerHex)) continue
+                val pid = peerIdFromName(svc.serviceName) ?: continue
+                if (!nodeIdGreater(myId, pid)) continue     // tiebreaker: only the greater id dials
+                dialing.add(peerHex)
+                toResolve.add(svc)
+            }
+        }
+        for (svc in toResolve) {
+            Log.i(TAG, "lan rescan re-resolve ${svc.serviceName?.take(8)}")
+            enqueueResolve(svc)
+        }
     }
 
     override fun send(bytes: ByteArray, link: LinkId) {
@@ -291,7 +327,9 @@ class LanBearer(private val ctx: Context, private val myId: ByteArray) : Bearer 
             override fun onStartDiscoveryFailed(t: String, e: Int) { Log.w(TAG, "lan nsd discover failed: $e") }
             override fun onStopDiscoveryFailed(t: String, e: Int) {}
             override fun onServiceFound(s: NsdServiceInfo) { handleServiceFound(s.serviceName, s) }
-            override fun onServiceLost(s: NsdServiceInfo) {}
+            override fun onServiceLost(s: NsdServiceInfo) {
+                peerIdFromName(s.serviceName)?.let { synchronized(lock) { knownServices.remove(it.toHex()) } }
+            }
         }
         discListener = disc
         runCatching { n.discoverServices(LAN_SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, disc) }
@@ -304,6 +342,7 @@ class LanBearer(private val ctx: Context, private val myId: ByteArray) : Bearer 
         val peerId = name?.let { peerIdFromName(it) } ?: return
         val peerHex = peerId.toHex()
         if (peerHex == myHex) return                                       // our own advertised service
+        synchronized(lock) { knownServices[peerHex] = svc }               // F-14: remember for rescan/retry
         if (!nodeIdGreater(myId, peerId)) return                           // tiebreaker: greater dials
         synchronized(lock) {
             if (linksByPeerId.containsKey(peerHex)) return                 // already linked

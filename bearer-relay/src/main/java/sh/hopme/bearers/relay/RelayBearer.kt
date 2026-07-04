@@ -41,6 +41,7 @@ import java.util.concurrent.TimeUnit
 
 private const val RELAY_BACKOFF_MIN_MS = 1_000L
 private const val RELAY_BACKOFF_MAX_MS = 30_000L
+private const val RELAY_STABLE_MS = 20_000L   // F-13: only reset backoff after the link holds this long
 
 class RelayBearer(private val relayUrl: String) : Bearer {
     override var sink: LinkSink? = null
@@ -64,6 +65,8 @@ class RelayBearer(private val relayUrl: String) : Bearer {
     private var started = false
     private var up = false
     private var backoffMs = RELAY_BACKOFF_MIN_MS
+    private var stableFuture: java.util.concurrent.ScheduledFuture<*>? = null  // F-13: stable→reset backoff
+    private var retryAfterMs: Long? = null                                     // F-13: 429 Retry-After
 
     // ---- Bearer ----
 
@@ -98,9 +101,16 @@ class RelayBearer(private val relayUrl: String) : Bearer {
         ws = client.newWebSocket(Request.Builder().url(relayUrl).build(), object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) = run {
                 exec.execute {
-                    up = true; backoffMs = RELAY_BACKOFF_MIN_MS
+                    up = true
                     Log.i(TAG, "relay link-up peer=${peerId.toHex().take(8)}")
                     sink?.linkUp(linkId, HopRole.DIALER, peerId)   // dialer = Noise initiator
+                    // F-13: reset backoff only after the link has been stable a while, not on open — a
+                    // relay that accepts then immediately drops isn't then re-dialed at the 1s floor forever.
+                    stableFuture?.cancel(false)
+                    stableFuture = exec.schedule(
+                        { if (up) backoffMs = RELAY_BACKOFF_MIN_MS },
+                        RELAY_STABLE_MS, TimeUnit.MILLISECONDS,
+                    )
                 }
             }
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) = run {
@@ -113,13 +123,24 @@ class RelayBearer(private val relayUrl: String) : Bearer {
                 exec.execute { Log.i(TAG, "relay closing: $code $reason"); down() }
             }
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) = run {
-                exec.execute { Log.w(TAG, "relay failed: ${t.message}"); down() }
+                // F-13: honor a 429 Retry-After from the upgrade response instead of hammering.
+                val ra: Long? = if (response?.code == 429) {
+                    (response.header("Retry-After")?.toLongOrNull()?.times(1000)) ?: RELAY_BACKOFF_MAX_MS
+                } else {
+                    null
+                }
+                exec.execute {
+                    if (ra != null) { retryAfterMs = ra; Log.w(TAG, "relay 429 rate-limited; backing off ${ra}ms") }
+                    else Log.w(TAG, "relay failed: ${t.message}")
+                    down()
+                }
             }
         })
     }
 
     /// Surface linkDown once (idempotent), drop the socket, then schedule a backoff reconnect.
     private fun down() {
+        stableFuture?.cancel(false); stableFuture = null
         ws = null
         if (up) { up = false; sink?.linkDown(linkId) }
         scheduleReconnect()
@@ -127,8 +148,19 @@ class RelayBearer(private val relayUrl: String) : Bearer {
 
     private fun scheduleReconnect() {
         if (!started) return
-        val delay = backoffMs
-        backoffMs = (backoffMs * 2).coerceAtMost(RELAY_BACKOFF_MAX_MS)
-        exec.schedule({ if (started && ws == null) dial() }, delay, TimeUnit.MILLISECONDS)
+        // F-13: honor a server-driven Retry-After when present; else exponential backoff. Always add
+        // jitter so an Android sub-fleet whose sockets drop together (e.g. a relay redeploy) doesn't
+        // reconnect in lockstep — Android previously had none.
+        val base = retryAfterMs
+        val delay: Long
+        if (base != null) {
+            retryAfterMs = null
+            delay = base
+        } else {
+            delay = backoffMs
+            backoffMs = (backoffMs * 2).coerceAtMost(RELAY_BACKOFF_MAX_MS)
+        }
+        val jitter = (Math.random() * 1000).toLong()
+        exec.schedule({ if (started && ws == null) dial() }, delay + jitter, TimeUnit.MILLISECONDS)
     }
 }
