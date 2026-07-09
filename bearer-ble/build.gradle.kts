@@ -16,4 +16,5 @@ android {
 dependencies {
     implementation(project(":hop-sdk"))   // Bearer/LinkSink/HopRole contract + transport helpers
 
+    testImplementation("junit:junit:4.13.2") // R7 dial-backoff unit test (pure JVM, no Android SDK)
 }

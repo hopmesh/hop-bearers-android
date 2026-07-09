@@ -96,6 +96,7 @@ internal const val MAX_DIALS = 2
 internal const val DIAL_TIMEOUT_MS = 12_000L
 internal const val LOST_MS = 30_000L
 internal const val CLOSE_GATT_AFTER_L2CAP = false // R5: free GATT slot after L2CAP up — OEM-risky; verify before enabling
+// R7 dial-backoff constants + math live in DialBackoff.kt (an Android-free file so they're unit-testable).
 
 // Wire frame types (SPEC §4). DATA (0x10) is the consumer seam: Bearer.send wraps the consumer's
 // application bytes in a DATA frame, and an inbound DATA frame is delivered via sink.linkBytes. The
@@ -492,6 +493,7 @@ internal class Central(
     private val main = Handler(Looper.getMainLooper())
     private val inFlight = mutableSetOf<String>() // R2: short-lived, MAC-keyed
     private val backoff = mutableMapOf<String, Long>() // R2: prefix-hex (stable) or MAC
+    private val failCount = mutableMapOf<String, Int>() // R7: consecutive dial failures per backoff key (drives the exponential)
     private val addrToBkey = HashMap<String, String>() // MAC → backoff key (prefix once known)
     private val addrToPeerId = HashMap<String, ByteArray>() // MAC → resolved peerId; dial-suppression for prefix-less (macOS/iOS) adverts
     private val pendingWaits = mutableSetOf<String>() // R4: one wait per MAC
@@ -650,6 +652,7 @@ internal class Central(
         addrToBkey[addr] = peerId.copyOfRange(0, 6).toHex() // R2: promote to stable nodeId prefix
         if (haveLinkTo(peerId)) { // R4: already linked → no redundant CoC
             Log.i(TAG, "GATT read: already linked to ${peerId.toHex().take(8)} → cancel dial")
+            dialSucceeded(addrToBkey[addr] ?: addr) // reached the peer → clear any prior backoff/failCount
             g.close(); gattByAddr.remove(addr); inFlight -= addr; return
         }
         val psm = ((value[0].toInt() and 0xff) shl 8) or (value[1].toInt() and 0xff)
@@ -662,7 +665,7 @@ internal class Central(
                 Log.i(TAG, "L2CAP dialed psm=$psm addr=$addr — wrapping link")
                 g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED)
                 inFlight -= addr
-                backoff.remove(addrToBkey[addr] ?: addr)
+                dialSucceeded(addrToBkey[addr] ?: addr) // R7: clear backoff + consecutive-failure count
                 val link = Link(
                     sock,
                     mintLinkId(),
@@ -693,15 +696,27 @@ internal class Central(
     private fun fail(addr: String) {
         inFlight -= addr
         val key = addrToBkey[addr] ?: addr
-        val remaining = (backoff[key] ?: 0L) - System.currentTimeMillis()
-        val base = remaining.coerceAtLeast(500L)
-        backoff[key] = System.currentTimeMillis() + minOf(base * 2, 30_000L) + (0..1000L).random()
+        // R7: grow by CONSECUTIVE failure count, not wall-clock delta (which never grew — a 12s dial
+        // timeout always outlasts the prior sub-2s window). Cleared on a successful dial (see handleRead).
+        val n = (failCount[key] ?: 0) + 1
+        failCount[key] = n
+        backoff[key] = System.currentTimeMillis() + nextBackoffMs(n, (0..1000L).random())
         evictBackoff() // R2: TTL bound
+    }
+
+    /// A dial reached a real, reachable Hop peer (PSM read succeeded / already-linked): reset its failure
+    /// state so a later transient hiccup starts backoff from the floor, not the quarantine.
+    private fun dialSucceeded(key: String) {
+        failCount.remove(key)
+        backoff.remove(key)
     }
 
     private fun evictBackoff() {
         val now = System.currentTimeMillis()
         backoff.entries.removeAll { it.value < now - LOST_MS }
+        // R7: forget the failure count once its backoff has aged out, so a peer seen again much later
+        // starts fresh from the floor rather than inheriting a stale quarantine.
+        failCount.keys.retainAll(backoff.keys)
     }
 }
 
