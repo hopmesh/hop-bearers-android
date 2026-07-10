@@ -16,4 +16,8 @@ android {
 dependencies {
     implementation(project(":hop-sdk"))   // Bearer/LinkSink/HopRole contract + transport helpers
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // quality-net-03: pure-JVM unit tests for the reconnect/backoff schedule (RelayBackoff.kt is
+    // Android-free so it loads under testDebugUnitTest).
+    testImplementation("junit:junit:4.13.2")
 }

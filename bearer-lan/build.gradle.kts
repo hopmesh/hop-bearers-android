@@ -16,4 +16,8 @@ android {
 }
 dependencies {
     implementation(project(":hop-sdk"))   // Bearer/LinkSink/HopRole contract + transport helpers
+
+    // quality-net-03: pure-JVM unit tests for the LAN wire codec + one-pipe-per-peer dedup keep-rule
+    // (LanWire.kt / LanDedup are deliberately Android-free so they load under testDebugUnitTest).
+    testImplementation("junit:junit:4.13.2")
 }

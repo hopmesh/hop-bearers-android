@@ -50,15 +50,11 @@ internal const val LAN_SERVICE_TYPE = "_hoplan._tcp"
 private const val LAN_PING_MS = 1000L     // 1 Hz keepalive
 private const val LAN_DEAD_MS = 15_000L   // TCP is reliable; a generous liveness deadline
 private const val LAN_REAP_MS = 5_000L    // close a connection that never completes HELLO
-private const val LAN_MAX_FRAME = 4 * 1024 * 1024
 private const val LAN_DIAL_TIMEOUT_MS = 5_000
 private const val LAN_RETRY_S = 5L   // F-14: rescan cadence to re-dial peers lost to a transient failure
 
-// Wire frame types — byte-identical to apple/HopBearers' LanBearer and to :bearer-ble's framing.
-private const val L_HELLO = 0x01
-private const val L_PING = 0x02
-private const val L_PONG = 0x03
-private const val L_DATA = 0x10
+// Wire frame types + the byte codec live in LanWire.kt (Android-free so they're unit-testable). They
+// are byte-identical to apple/HopBearers' LanBearer and to :bearer-ble's framing.
 
 // ---- LanLink: one TCP socket, same framing/keepalive/HELLO grammar as the BLE link + Apple LanLink ----
 internal class LanLink(
@@ -92,7 +88,7 @@ internal class LanLink(
     fun start() {
         runCatching { socket.tcpNoDelay = true }
         // HELLO first (same grammar as BLE/Apple): [0x01][16B nodeId][1B role][1B flags]
-        sendFrame(byteArrayOf(L_HELLO.toByte()) + myId + byteArrayOf((if (isDialer) 1 else 0).toByte(), 0))
+        sendFrame(LanWire.hello(myId, isDialer))
         Log.i(TAG, "lan channel-ready isDialer=$isDialer — sent HELLO")
         thread(name = "lan-rx") { readLoop() }
         sched.scheduleAtFixedRate({ tick() }, LAN_PING_MS, LAN_PING_MS, TimeUnit.MILLISECONDS)
@@ -103,24 +99,18 @@ internal class LanLink(
         if (!up && now - openedMs > LAN_REAP_MS) { close("no-HELLO reap"); return }
         if (up && now - lastRxMs > LAN_DEAD_MS) { close("liveness DEAD (silent ${now - lastRxMs}ms)"); return }
         txSeq++
-        sendFrame(byteArrayOf(L_PING.toByte()) + u64(txSeq) + u64(now))
+        sendFrame(LanWire.ping(txSeq, now))
     }
 
     /// Bearer.send entry point: wrap the consumer's application bytes in a DATA frame (0x10) and send.
     fun sendData(bytes: ByteArray) {
         if (closed) return
-        sendFrame(byteArrayOf(L_DATA.toByte()) + bytes)
+        sendFrame(LanWire.data(bytes))
     }
 
     private fun sendFrame(body: ByteArray) {
         if (closed) return
-        val n = body.size
-        val hdr = byteArrayOf(
-            (n ushr 24).toByte(),
-            (n ushr 16).toByte(),
-            (n ushr 8).toByte(),
-            n.toByte(),
-        )
+        val hdr = LanWire.lengthPrefix(body.size)
         try {
             synchronized(writeLock) { out.write(hdr); out.write(body); out.flush() }
         } catch (e: IOException) {
@@ -133,8 +123,8 @@ internal class LanLink(
         try {
             while (!closed) {
                 readFully(hdr, 4)
-                val len = (hdr[0].i shl 24) or (hdr[1].i shl 16) or (hdr[2].i shl 8) or hdr[3].i
-                if (len < 1 || len > LAN_MAX_FRAME) { close("bad len $len"); return }
+                val len = LanWire.readLength(hdr)
+                if (!LanWire.isValidLength(len)) { close("bad len $len"); return }
                 val body = ByteArray(len)
                 readFully(body, len)
                 lastRxMs = System.currentTimeMillis()
@@ -157,14 +147,14 @@ internal class LanLink(
     private fun handle(b: ByteArray) {
         when (b[0].toInt() and 0xff) {
             L_HELLO -> if (b.size >= 17 && !up) { // HELLO learns the peer id → surface linkUp
-                peerId = b.copyOfRange(1, 17)
+                peerId = LanWire.helloPeerId(b)
                 up = true
                 Log.i(TAG, "lan hello-recv peer=${peerId!!.toHex().take(8)} isDialer=$isDialer")
                 onUp(this)
             }
             L_PING -> { // PING → PONG. seq is the peer's monotonic keepalive counter (never surfaced).
                 if (b.size < 9) return
-                rxSeq = u64dec(b, 1)
+                rxSeq = LanWire.u64dec(b, 1)
                 sendFrame(byteArrayOf(L_PONG.toByte()) + b.copyOfRange(1, minOf(17, b.size)))
             }
             L_PONG -> { /* reverse-direction liveness; lastRxMs already bumped in readLoop */ }
@@ -181,14 +171,6 @@ internal class LanLink(
         try { socket.close() } catch (_: IOException) {}
         onClose(this)
     }
-
-    private fun u64(v: Long) = ByteArray(8) { (v ushr (56 - it * 8)).toByte() }
-    private fun u64dec(b: ByteArray, o: Int): Long {
-        var v = 0L
-        for (i in 0..7) v = (v shl 8) or (b[o + i].toLong() and 0xff)
-        return v
-    }
-    private val Byte.i get() = toInt() and 0xff
 }
 
 // ---- LanBearer: NSD register + discover, one TCP ServerSocket, one-pipe-per-peer dedup, monotonic id --
@@ -417,8 +399,12 @@ class LanBearer(private val ctx: Context, private val myId: ByteArray) : Bearer 
             if (existing == null || existing === link) {
                 linksByPeerId[key] = link
             } else {
-                val keepDialed = nodeIdGreater(myId, peer) // keep MY dialed channel iff I'm the greater id
-                val keep = listOf(existing, link).firstOrNull { it.isDialer == keepDialed } ?: link
+                // Pure keep-rule (LanDedup): keep MY dialed channel iff I'm the greater id, else keep
+                // MY accepted channel, so both ends independently agree on the same survivor.
+                val keep = when (LanDedup.decide(nodeIdGreater(myId, peer), existing.isDialer, link.isDialer)) {
+                    DedupKeep.EXISTING -> existing
+                    DedupKeep.INCOMING -> link
+                }
                 drop = if (keep === link) existing else link
                 linksByPeerId[key] = keep // set survivor BEFORE closing the dropped channel
                 Log.i(TAG, "lan DEDUP kept isDialer=${keep.isDialer} peer=${key.take(8)}")
@@ -446,8 +432,9 @@ class LanBearer(private val ctx: Context, private val myId: ByteArray) : Bearer 
 }
 
 /// The NSD instance name is the peer's 32-hex-char nodeId. Parse it back to 16 bytes (mirror Apple's
-/// peerIdFromName). Returns null for any name that is not exactly 32 hex chars.
-private fun peerIdFromName(name: String?): ByteArray? {
+/// peerIdFromName). Returns null for any name that is not exactly 32 hex chars. `internal` so the
+/// round-trip is unit-testable (nodeId -> hex instance name -> nodeId).
+internal fun peerIdFromName(name: String?): ByteArray? {
     if (name == null || name.length != 32) return null
     val out = ByteArray(16)
     for (i in 0 until 16) {

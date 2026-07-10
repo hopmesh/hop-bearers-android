@@ -39,14 +39,9 @@ import java.util.concurrent.TimeUnit
 // onto a single-thread executor so all bearer state lives on one thread (no locks). OkHttp's send is
 // itself thread-safe, so send() may be called from any thread.
 
-private const val RELAY_BACKOFF_MIN_MS = 1_000L
-private const val RELAY_BACKOFF_MAX_MS = 30_000L
-private const val RELAY_STABLE_MS = 20_000L   // F-13: only reset backoff after the link holds this long
-// android-09: once the relay has been unreachable for many CONSECUTIVE dials (the fleet is torn down,
-// not a transient blip), stop waking the radio every ~30s and back off to several minutes. A live
-// link that stays up past RELAY_STABLE_MS resets both the delay AND this streak.
-private const val RELAY_DEAD_AFTER = 8          // consecutive failed dials before the long ceiling kicks in
-private const val RELAY_BACKOFF_DEAD_MS = 300_000L  // ~5 min ceiling for a clearly-dead endpoint
+// The backoff constants + the pure reconnect-schedule arithmetic live in RelayBackoff.kt (Android-free
+// so they're unit-testable). RELAY_BACKOFF_MIN_MS / _MAX_MS / _STABLE_MS / _DEAD_AFTER / _DEAD_MS are
+// defined there; RelayBearer owns only the state machine that calls RelayBackoff.step().
 
 class RelayBearer(private val relayUrl: String) : Bearer {
     override var sink: LinkSink? = null
@@ -131,7 +126,7 @@ class RelayBearer(private val relayUrl: String) : Bearer {
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) = run {
                 // F-13: honor a 429 Retry-After from the upgrade response instead of hammering.
                 val ra: Long? = if (response?.code == 429) {
-                    (response.header("Retry-After")?.toLongOrNull()?.times(1000)) ?: RELAY_BACKOFF_MAX_MS
+                    RelayBackoff.retryAfterFrom429(response.header("Retry-After")?.toLongOrNull())
                 } else {
                     null
                 }
@@ -154,26 +149,17 @@ class RelayBearer(private val relayUrl: String) : Bearer {
 
     private fun scheduleReconnect() {
         if (!started) return
-        // F-13: honor a server-driven Retry-After when present; else exponential backoff. Always add
-        // jitter so an Android sub-fleet whose sockets drop together (e.g. a relay redeploy) doesn't
-        // reconnect in lockstep — Android previously had none.
-        // android-09: count every reconnect as a consecutive failed dial. A stable link resets it.
+        // F-13/android-09: pure schedule (RelayBackoff.step): honor a one-shot 429 Retry-After, else
+        // exponential backoff doubling to the cap, else the multi-minute dead ceiling once the endpoint
+        // has failed RELAY_DEAD_AFTER dials in a row. Count every reconnect as a consecutive failed dial;
+        // a stable link (onOpen + RELAY_STABLE_MS) resets both the base and the streak.
         deadStreak++
-        val base = retryAfterMs
-        val delay: Long
-        if (base != null) {
-            retryAfterMs = null
-            delay = base
-        } else if (deadStreak >= RELAY_DEAD_AFTER) {
-            // Endpoint has been dead for many attempts (fleet torn down): stop waking the radio every
-            // ~30s and hold at the multi-minute ceiling until it comes back.
-            delay = RELAY_BACKOFF_DEAD_MS
-            backoffMs = RELAY_BACKOFF_MAX_MS
-        } else {
-            delay = backoffMs
-            backoffMs = (backoffMs * 2).coerceAtMost(RELAY_BACKOFF_MAX_MS)
-        }
+        val step = RelayBackoff.step(deadStreak, backoffMs, retryAfterMs)
+        retryAfterMs = null       // a Retry-After is consumed exactly once
+        backoffMs = step.nextBackoffMs
+        // Always add jitter so an Android sub-fleet whose sockets drop together (e.g. a relay redeploy)
+        // doesn't reconnect in lockstep (Android previously had none).
         val jitter = (Math.random() * 1000).toLong()
-        exec.schedule({ if (started && ws == null) dial() }, delay + jitter, TimeUnit.MILLISECONDS)
+        exec.schedule({ if (started && ws == null) dial() }, step.delayMs + jitter, TimeUnit.MILLISECONDS)
     }
 }
