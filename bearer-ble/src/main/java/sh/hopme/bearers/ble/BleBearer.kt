@@ -77,6 +77,12 @@ internal const val APPLE_COMPANY_ID = 0x004C
 internal const val BEACON_CYCLE_MS = 300_000L   // ~5 min: floor for CoreLocation relaunch rate-limit
 internal const val BEACON_EXIT_GAP_MS = 35_000L // > iOS ~30 s exit-debounce, so stop→start makes a clean enter
 internal const val HEAL_INTERVAL_S = 30L        // F-12: peripheral self-heal cadence (re-arm listener/advertiser)
+// android-07: a silently-wedged advertiser keeps its AdvertisingSet object (so startAdvertise()'s
+// no-op guard never fires) but stops emitting — the documented post-restart invisibility. Periodically
+// FORCE a stop+restart of the connectable advertiser so a wedged set is actively recycled. Kept coarse
+// (few minutes) so it costs little battery and never disrupts a healthy advertiser for long.
+internal const val ADV_PROBE_MS = 180_000L      // ~3 min: force-recycle the connectable advertiser
+internal const val ADV_PROBE_GAP_MS = 1_500L    // brief stop→start gap so the controller drops the old set cleanly
 
 internal fun iBeaconPayload(uuid: UUID, major: Int, minor: Int, measuredPowerDbm: Int): ByteArray {
     val b = java.nio.ByteBuffer.allocate(23)          // ByteBuffer is big-endian by default
@@ -238,7 +244,7 @@ internal class Link(
                 peerId = b.copyOfRange(1, 17)
                 up = true
                 becameUpMs = System.currentTimeMillis()
-                Log.i(TAG, "LINK UP isDialer=$isDialer peer=${peerId!!.toHex().take(8)} — HELLO both ways")
+                Log.i(TAG, "LINKFLOW LINK UP link=$linkId isDialer=$isDialer peer=${peerId!!.toHex().take(8)} — HELLO both ways")
                 onUp(this)
             }
             FRAME_PING -> { // PING → PONG. seq is the peer's monotonic keepalive counter.
@@ -265,7 +271,7 @@ internal class Link(
     fun close(why: String) {
         if (closed) return
         closed = true
-        Log.i(TAG, "LINK CLOSED ($why) isDialer=$isDialer peer=${peerId?.toHex()?.take(8)}")
+        Log.i(TAG, "LINKFLOW LINK CLOSED link=$linkId ($why) isDialer=$isDialer peer=${peerId?.toHex()?.take(8)}")
         sched.shutdownNow()
         try { socket.close() } catch (_: IOException) {}
         onClose(this)
@@ -323,6 +329,7 @@ internal class Peripheral(
         startBeacon()
         startBeaconCycler()
         startSelfHeal()   // F-12: re-arm listener/advertiser/beacon if any of them drops
+        startAdvertiserProbe() // android-07: actively recycle a silently-wedged advertiser
     }
 
     // F-10: opening the L2CAP listener can throw (BT off at launch, transient adapter error). Guard it
@@ -463,6 +470,22 @@ internal class Peripheral(
         adv.startAdvertisingSet(params, data, null, null, null, beaconCb)
     }
 
+    // android-07: force-recycle the connectable advertiser on a coarse timer. onAdvertisingSetStopped
+    // nulls advSet, so the delayed startAdvertise() re-arms it; a wedged set that never emits the stop
+    // callback is torn down here regardless. Guarded on adapter.isEnabled + not stopped so it never
+    // fights the BT-off teardown.
+    fun startAdvertiserProbe() {
+        beaconSched.scheduleAtFixedRate({
+            if (stopped) return@scheduleAtFixedRate
+            try {
+                if (!adapter.isEnabled) return@scheduleAtFixedRate
+                Log.i(TAG, "ADV PROBE: force stop+restart advertiser (wedge recovery)")
+                adapter.bluetoothLeAdvertiser?.stopAdvertisingSet(advCb); advSet = null
+                beaconSched.schedule({ if (!stopped) startAdvertise() }, ADV_PROBE_GAP_MS, TimeUnit.MILLISECONDS)
+            } catch (_: Exception) {}
+        }, ADV_PROBE_MS, ADV_PROBE_MS, TimeUnit.MILLISECONDS)
+    }
+
     // Manufacture iOS region exit→enter so a force-quit iOS app that is sitting adjacent gets relaunched.
     fun startBeaconCycler() {
         beaconSched.scheduleAtFixedRate({
@@ -491,6 +514,12 @@ internal class Central(
     private val adapter =
         (ctx.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
     private val main = Handler(Looper.getMainLooper())
+    // android-04: every dial-state map below is read/mutated from THREE contexts — the main handler
+    // (tryDial / scan callbacks), the Binder GATT-callback threads (gattCb / handleRead), and the
+    // l2cap-dial thread. HashMap under concurrent mutation corrupts (a MAC stuck in inFlight silently
+    // wedges all future dials to that device), so ONE lock now guards every access. Hold `dial` only
+    // for map bookkeeping; never call Android/GATT under it.
+    private val dial = Any()
     private val inFlight = mutableSetOf<String>() // R2: short-lived, MAC-keyed
     private val backoff = mutableMapOf<String, Long>() // R2: prefix-hex (stable) or MAC
     private val failCount = mutableMapOf<String, Int>() // R7: consecutive dial failures per backoff key (drives the exponential)
@@ -498,6 +527,9 @@ internal class Central(
     private val addrToPeerId = HashMap<String, ByteArray>() // MAC → resolved peerId; dial-suppression for prefix-less (macOS/iOS) adverts
     private val pendingWaits = mutableSetOf<String>() // R4: one wait per MAC
     private val gattByAddr = HashMap<String, BluetoothGatt>()
+    // android-05: the per-dial 12s timeout Runnable, keyed by MAC, so a completing dial can cancel it
+    // before it fires against a newer GATT for the same address.
+    private val dialTimeouts = HashMap<String, Runnable>()
     private val scanStarts = ArrayDeque<Long>() // R9: 30 s sliding window of startScan times
     private var scanning = false
     private var currentMode = -1
@@ -508,11 +540,17 @@ internal class Central(
         try { if (scanning) adapter.bluetoothLeScanner?.stopScan(scanCb) } catch (_: Exception) {}
         scanning = false
         currentMode = -1
-        synchronized(gattByAddr) {
-            gattByAddr.values.forEach { try { it.close() } catch (_: Exception) {} }
+        val gatts: List<BluetoothGatt>
+        val timeouts: List<Runnable>
+        synchronized(dial) {
+            gatts = gattByAddr.values.toList()
             gattByAddr.clear()
+            timeouts = dialTimeouts.values.toList()
+            dialTimeouts.clear()
+            inFlight.clear()
         }
-        inFlight.clear()
+        gatts.forEach { try { it.close() } catch (_: Exception) {} }
+        timeouts.forEach { main.removeCallbacks(it) }
     }
 
     fun requestScanMode(mode: Int, debounceMs: Long) { // R9: hysteresis (Node passes 10 s down / 2 s up)
@@ -546,9 +584,9 @@ internal class Central(
             val dialNow = if (pre != null) nodeIdGreater(myId.copyOfRange(0, 6), pre) else true // §2.1
             if (dialNow) {
                 tryDial(dev, pre)
-            } else if (pendingWaits.add(dev.address)) { // R4: one wait per peer
+            } else if (synchronized(dial) { pendingWaits.add(dev.address) }) { // R4: one wait per peer
                 main.postDelayed({
-                    pendingWaits.remove(dev.address)
+                    synchronized(dial) { pendingWaits.remove(dev.address) }
                     if (pre != null && haveLinkToPrefix(pre)) return@postDelayed // R4: gate on link map
                     Log.i(TAG, "WAIT-TIMEOUT fired → dialing ${dev.address}")
                     tryDial(dev, pre)
@@ -563,31 +601,57 @@ internal class Central(
 
     private fun tryDial(dev: BluetoothDevice, pre: ByteArray?) {
         val addr = dev.address
-        if (inFlight.size >= MAX_DIALS || addr in inFlight) return
-        if (pre != null && haveLinkToPrefix(pre)) return // R4 (advert carries the mfg prefix)
         // Address-based suppression: peers whose advert has NO mfg prefix (pre=null — the macOS/iOS
         // peripherals) skip the prefix gate and were re-dialed on EVERY advert just to cancel after the
         // PSM read (the redial storm: ~99% wasted GATT connects, a battery/radio killer on BLE-only
         // nodes). Once we've resolved this MAC's peerId, suppress re-dials while we hold that link.
-        addrToPeerId[addr]?.let { if (haveLinkTo(it)) return }
+        if (pre != null && haveLinkToPrefix(pre)) return // R4 (advert carries the mfg prefix)
         val bkey = pre?.toHex() ?: addr
-        if (System.currentTimeMillis() < (backoff[bkey] ?: 0L)) return // R2
-        addrToBkey[addr] = bkey
-        inFlight += addr
-        Log.i(TAG, "DIALING addr=$addr prefix=${pre?.toHex()} inFlight=${inFlight.size}")
-        val g = dev.connectGatt(ctx, false, gattCb, BluetoothDevice.TRANSPORT_LE) // MAIN thread, autoConnect=false
-        gattByAddr[addr] = g
-        main.postDelayed({
-            if (addr in inFlight) {
+        // android-04: decide + claim the dial slot atomically under `dial`. The old code read inFlight,
+        // backoff, addrToBkey on separate unlocked ops, so two concurrent dials could both pass the gate
+        // (duplicate GATT connects → leaked client slots → the one-MAC wedge). Claim inFlight here.
+        val g: BluetoothGatt = synchronized(dial) {
+            if (inFlight.size >= MAX_DIALS || addr in inFlight) return
+            addrToPeerId[addr]?.let { if (haveLinkTo(it)) return }
+            if (System.currentTimeMillis() < (backoff[bkey] ?: 0L)) return // R2
+            addrToBkey[addr] = bkey
+            inFlight += addr
+            Log.i(TAG, "DIALING addr=$addr prefix=${pre?.toHex()} inFlight=${inFlight.size}")
+            // connectGatt must run on the caller (main) thread; it returns synchronously, so it is safe
+            // to hold `dial` across it (no reentrant GATT callback fires before we return here).
+            val gatt = dev.connectGatt(ctx, false, gattCb, BluetoothDevice.TRANSPORT_LE) // autoConnect=false
+            gattByAddr[addr] = gatt
+            gatt
+        }
+        // android-05: the timeout is identity-checked (only acts if gattByAddr[addr] is STILL this g) and
+        // is cancelled by every dial completion/failure via clearDialTimeout(). Without the identity
+        // check, an old timeout firing after a fast fail + a fresh re-dial would close the NEW gatt,
+        // spuriously bump failCount, and free inFlight while the new GATT is still connecting.
+        val timeout = object : Runnable {
+            override fun run() {
+                val stillOurs = synchronized(dial) {
+                    if (gattByAddr[addr] !== g) { dialTimeouts.remove(addr, this); false }
+                    else { dialTimeouts.remove(addr); gattByAddr.remove(addr); true }
+                }
+                if (!stillOurs) return
                 // A stuck dial is most often service-discovery that never completes: an iOS peer
                 // rotated its random MAC or re-published its GATT server, and Android's cached
                 // (now-empty) service list makes discoverServices() return nothing forever — the
                 // 6-minute pixel→xr wedge. refresh() drops that cache so the next dial re-reads.
                 Log.w(TAG, "DIAL TIMEOUT addr=$addr → refresh cache + closing GATT")
                 refreshGattCache(g)
-                g.close(); gattByAddr.remove(addr); fail(addr)
+                g.close(); fail(addr)
             }
-        }, DIAL_TIMEOUT_MS) // R6
+        }
+        synchronized(dial) { dialTimeouts[addr] = timeout }
+        main.postDelayed(timeout, DIAL_TIMEOUT_MS) // R6
+    }
+
+    /// android-05: cancel + forget the pending dial-timeout for this MAC. Called from every dial
+    /// completion/failure path so a stale timeout can never act against a newer dial to the same addr.
+    private fun clearDialTimeout(addr: String) {
+        val t = synchronized(dial) { dialTimeouts.remove(addr) } ?: return
+        main.removeCallbacks(t)
     }
 
     /// Clear Android's cached GATT service list for this connection via the hidden
@@ -606,7 +670,8 @@ internal class Central(
                 g.discoverServices()
             } else {
                 Log.i(TAG, "GATT state addr=$addr status=$status newState=$newState → close()")
-                g.close(); gattByAddr.remove(addr); fail(addr) // ALWAYS close (§7.2)
+                clearDialTimeout(addr)
+                g.close(); forgetGatt(addr, g); fail(addr) // ALWAYS close (§7.2)
             }
         }
 
@@ -616,8 +681,10 @@ internal class Central(
                 Log.i(TAG, "GATT services discovered addr=${g.device.address} → readCharacteristic")
                 g.readCharacteristic(ch)
             } else {
-                Log.w(TAG, "GATT service/char missing addr=${g.device.address} → close()")
-                g.close(); gattByAddr.remove(g.device.address); fail(g.device.address)
+                val addr = g.device.address
+                Log.w(TAG, "GATT service/char missing addr=$addr → close()")
+                clearDialTimeout(addr)
+                g.close(); forgetGatt(addr, g); fail(addr)
             }
         }
 
@@ -645,15 +712,20 @@ internal class Central(
         val addr = g.device.address
         if (status != BluetoothGatt.GATT_SUCCESS || value.size < 18) {
             Log.w(TAG, "GATT read bad status=$status size=${value.size} addr=$addr → close()")
-            g.close(); gattByAddr.remove(addr); fail(addr); return
+            clearDialTimeout(addr)
+            g.close(); forgetGatt(addr, g); fail(addr); return
         }
         val peerId = value.copyOfRange(2, 18)
-        addrToPeerId[addr] = peerId // remember MAC→peerId so future prefix-less adverts from this MAC are dial-suppressed while linked
-        addrToBkey[addr] = peerId.copyOfRange(0, 6).toHex() // R2: promote to stable nodeId prefix
+        synchronized(dial) {
+            addrToPeerId[addr] = peerId // remember MAC→peerId so future prefix-less adverts are suppressed while linked
+            addrToBkey[addr] = peerId.copyOfRange(0, 6).toHex() // R2: promote to stable nodeId prefix
+        }
+        val bkey = bkeyOf(addr)
         if (haveLinkTo(peerId)) { // R4: already linked → no redundant CoC
             Log.i(TAG, "GATT read: already linked to ${peerId.toHex().take(8)} → cancel dial")
-            dialSucceeded(addrToBkey[addr] ?: addr) // reached the peer → clear any prior backoff/failCount
-            g.close(); gattByAddr.remove(addr); inFlight -= addr; return
+            dialSucceeded(bkey) // reached the peer → clear any prior backoff/failCount
+            clearDialTimeout(addr)
+            g.close(); forgetGatt(addr, g); synchronized(dial) { inFlight -= addr }; return
         }
         val psm = ((value[0].toInt() and 0xff) shl 8) or (value[1].toInt() and 0xff)
         Log.i(TAG, "READ psm=$psm peer=${peerId.toHex().take(8)} addr=$addr → openL2CAP")
@@ -664,53 +736,86 @@ internal class Central(
                 sock.connect()
                 Log.i(TAG, "L2CAP dialed psm=$psm addr=$addr — wrapping link")
                 g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED)
-                inFlight -= addr
-                dialSucceeded(addrToBkey[addr] ?: addr) // R7: clear backoff + consecutive-failure count
+                // android-05/06: the socket is connected but the link is not yet UP (no HELLO). Cancel the
+                // dial timeout (this dial reached L2CAP), free inFlight, but DO NOT declare success here.
+                // Backoff-reset now happens on HELLO-complete (dialerLinkUp) so a peer that accepts L2CAP
+                // and never completes HELLO still accrues backoff via dialerLinkClosed(fail) instead of
+                // being re-dialed on every advert with failCount pinned to zero.
+                clearDialTimeout(addr)
+                synchronized(dial) { inFlight -= addr }
                 val link = Link(
                     sock,
                     mintLinkId(),
                     isDialer = true,
                     myId,
-                    onLink,
+                    onUp = { l -> dialerLinkUp(addr); onLink(l) },
                     onData,
                     onClose = { l -> dialerLinkClosed(g, addr, l); onClose(l) },
                 )
-                if (CLOSE_GATT_AFTER_L2CAP) { g.close(); gattByAddr.remove(addr) } // R5 (flagged, default off)
+                if (CLOSE_GATT_AFTER_L2CAP) { g.close(); forgetGatt(addr, g) } // R5 (flagged, default off)
                 link.start()
             } catch (e: IOException) {
                 Log.w(TAG, "L2CAP dial failed psm=$psm addr=$addr: ${e.message} → close()")
-                g.close(); gattByAddr.remove(addr); fail(addr)
+                clearDialTimeout(addr)
+                g.close(); forgetGatt(addr, g); fail(addr)
             }
         }
+    }
+
+    /// android-06: the dialed link completed HELLO (reached UP). NOW clear backoff + failure count —
+    /// this is the point that proves a real, reachable Hop peer, not merely an accepted L2CAP socket.
+    private fun dialerLinkUp(addr: String) {
+        dialSucceeded(bkeyOf(addr))
     }
 
     private fun dialerLinkClosed(g: BluetoothGatt, addr: String, l: Link) {
         if (!CLOSE_GATT_AFTER_L2CAP) {
             try { g.close() } catch (_: Exception) {}
-            gattByAddr.remove(addr)
+            forgetGatt(addr, g)
         }
-        inFlight -= addr
-        if (l.stableUp()) backoff.remove(addrToBkey[addr] ?: addr) // §6 reset after long-lived link
+        synchronized(dial) { inFlight -= addr }
+        // android-06: a link that never reached UP (accepted L2CAP but no HELLO — a wedged/half-dead peer
+        // stack) must accrue backoff, or it is re-dialed on every advert forever with failCount at zero,
+        // monopolizing a dial slot. Only a link that was actually UP resets backoff.
+        if (l.up) {
+            if (l.stableUp()) backoff.remove(bkeyOf(addr)) // §6 reset after long-lived link
+        } else {
+            fail(addr) // connect-then-no-HELLO: count it as a failed dial
+        }
     }
 
     private fun fail(addr: String) {
-        inFlight -= addr
-        val key = addrToBkey[addr] ?: addr
-        // R7: grow by CONSECUTIVE failure count, not wall-clock delta (which never grew — a 12s dial
-        // timeout always outlasts the prior sub-2s window). Cleared on a successful dial (see handleRead).
-        val n = (failCount[key] ?: 0) + 1
-        failCount[key] = n
-        backoff[key] = System.currentTimeMillis() + nextBackoffMs(n, (0..1000L).random())
-        evictBackoff() // R2: TTL bound
+        synchronized(dial) {
+            inFlight -= addr
+            val key = addrToBkey[addr] ?: addr
+            // R7: grow by CONSECUTIVE failure count, not wall-clock delta (which never grew — a 12s dial
+            // timeout always outlasts the prior sub-2s window). Cleared on a link-UP (see dialerLinkUp).
+            val n = (failCount[key] ?: 0) + 1
+            failCount[key] = n
+            backoff[key] = System.currentTimeMillis() + nextBackoffMs(n, (0..1000L).random())
+            evictBackoff() // R2: TTL bound
+        }
     }
 
-    /// A dial reached a real, reachable Hop peer (PSM read succeeded / already-linked): reset its failure
-    /// state so a later transient hiccup starts backoff from the floor, not the quarantine.
+    /// A dial reached a real, reachable Hop peer (link UP / already-linked): reset its failure state so a
+    /// later transient hiccup starts backoff from the floor, not the quarantine.
     private fun dialSucceeded(key: String) {
-        failCount.remove(key)
-        backoff.remove(key)
+        synchronized(dial) {
+            failCount.remove(key)
+            backoff.remove(key)
+        }
     }
 
+    /// Read the (locked) backoff key for a MAC, defaulting to the MAC before its prefix is resolved.
+    private fun bkeyOf(addr: String): String = synchronized(dial) { addrToBkey[addr] ?: addr }
+
+    /// android-05: identity-checked GATT forget — only drop the map entry if it STILL points at `g`, so a
+    /// concurrent re-dial's fresh GATT is never accidentally removed by an old callback for the same MAC.
+    private fun forgetGatt(addr: String, g: BluetoothGatt) {
+        synchronized(dial) { if (gattByAddr[addr] === g) gattByAddr.remove(addr) }
+    }
+
+    // caller already holds `dial`.
     private fun evictBackoff() {
         val now = System.currentTimeMillis()
         backoff.entries.removeAll { it.value < now - LOST_MS }
@@ -855,7 +960,7 @@ class BleBearer(private val ctx: Context, private val myId: ByteArray) : Bearer 
                 val keep = listOf(existing, link).firstOrNull { it.isDialer == keepDialed } ?: link
                 drop = if (keep === link) existing else link
                 linksByPeerId[key] = keep // R3: set survivor BEFORE closing the dropped channel
-                Log.i(TAG, "DEDUP kept isDialer=${keep.isDialer} peer=${key.take(8)}")
+                Log.i(TAG, "LINKFLOW DEDUP keep=${keep.linkId} drop=${drop?.linkId} isDialer=${keep.isDialer} peer=${key.take(8)}")
             }
         }
         drop?.close("dedup") // outside lock: close → onClose → sink.linkDown for the loser

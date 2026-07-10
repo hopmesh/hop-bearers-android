@@ -42,6 +42,11 @@ import java.util.concurrent.TimeUnit
 private const val RELAY_BACKOFF_MIN_MS = 1_000L
 private const val RELAY_BACKOFF_MAX_MS = 30_000L
 private const val RELAY_STABLE_MS = 20_000L   // F-13: only reset backoff after the link holds this long
+// android-09: once the relay has been unreachable for many CONSECUTIVE dials (the fleet is torn down,
+// not a transient blip), stop waking the radio every ~30s and back off to several minutes. A live
+// link that stays up past RELAY_STABLE_MS resets both the delay AND this streak.
+private const val RELAY_DEAD_AFTER = 8          // consecutive failed dials before the long ceiling kicks in
+private const val RELAY_BACKOFF_DEAD_MS = 300_000L  // ~5 min ceiling for a clearly-dead endpoint
 
 class RelayBearer(private val relayUrl: String) : Bearer {
     override var sink: LinkSink? = null
@@ -65,6 +70,7 @@ class RelayBearer(private val relayUrl: String) : Bearer {
     private var started = false
     private var up = false
     private var backoffMs = RELAY_BACKOFF_MIN_MS
+    private var deadStreak = 0                                                  // android-09: consecutive failed dials
     private var stableFuture: java.util.concurrent.ScheduledFuture<*>? = null  // F-13: stable→reset backoff
     private var retryAfterMs: Long? = null                                     // F-13: 429 Retry-After
 
@@ -108,7 +114,7 @@ class RelayBearer(private val relayUrl: String) : Bearer {
                     // relay that accepts then immediately drops isn't then re-dialed at the 1s floor forever.
                     stableFuture?.cancel(false)
                     stableFuture = exec.schedule(
-                        { if (up) backoffMs = RELAY_BACKOFF_MIN_MS },
+                        { if (up) { backoffMs = RELAY_BACKOFF_MIN_MS; deadStreak = 0 } }, // android-09: a stable link clears the dead streak
                         RELAY_STABLE_MS, TimeUnit.MILLISECONDS,
                     )
                 }
@@ -151,11 +157,18 @@ class RelayBearer(private val relayUrl: String) : Bearer {
         // F-13: honor a server-driven Retry-After when present; else exponential backoff. Always add
         // jitter so an Android sub-fleet whose sockets drop together (e.g. a relay redeploy) doesn't
         // reconnect in lockstep — Android previously had none.
+        // android-09: count every reconnect as a consecutive failed dial. A stable link resets it.
+        deadStreak++
         val base = retryAfterMs
         val delay: Long
         if (base != null) {
             retryAfterMs = null
             delay = base
+        } else if (deadStreak >= RELAY_DEAD_AFTER) {
+            // Endpoint has been dead for many attempts (fleet torn down): stop waking the radio every
+            // ~30s and hold at the multi-minute ceiling until it comes back.
+            delay = RELAY_BACKOFF_DEAD_MS
+            backoffMs = RELAY_BACKOFF_MAX_MS
         } else {
             delay = backoffMs
             backoffMs = (backoffMs * 2).coerceAtMost(RELAY_BACKOFF_MAX_MS)
