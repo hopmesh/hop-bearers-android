@@ -956,8 +956,14 @@ class BleBearer(private val ctx: Context, private val myId: ByteArray) : Bearer 
             if (existing == null || existing === link) {
                 linksByPeerId[key] = link
             } else {
-                val keepDialed = nodeIdGreater(myId, peer) // keep MY dialed channel iff I'm the greater id
-                val keep = listOf(existing, link).firstOrNull { it.isDialer == keepDialed } ?: link
+                // android-r2-07: the greater-nodeId keep-rule, now via the unit-tested pure BleDedup so
+                // this historically defect-prone seam has coverage. keepDialed = am-I-greater; keep the
+                // channel whose isDialer matches, so both ends independently pick the same survivor.
+                val amGreater = nodeIdGreater(myId, peer)
+                val keep = when (BleDedup.decide(amGreater, existing.isDialer, link.isDialer)) {
+                    BleDedupKeep.EXISTING -> existing
+                    BleDedupKeep.INCOMING -> link
+                }
                 drop = if (keep === link) existing else link
                 linksByPeerId[key] = keep // R3: set survivor BEFORE closing the dropped channel
                 Log.i(TAG, "LINKFLOW DEDUP keep=${keep.linkId} drop=${drop?.linkId} isDialer=${keep.isDialer} peer=${key.take(8)}")
