@@ -72,6 +72,9 @@ class RelayBearer(private val relayUrl: String) : Bearer {
     // ---- Bearer ----
 
     override fun start() {
+        // A stopped bearer is terminal (the manager registers a fresh instance on re-enable), so once
+        // exec is shut down start() is an intentional no-op rather than a RejectedExecutionException.
+        if (exec.isShutdown) return
         exec.execute {
             if (started) return@execute
             started = true
@@ -81,18 +84,37 @@ class RelayBearer(private val relayUrl: String) : Bearer {
     }
 
     override fun stop() {
+        // Idempotent: a second stop() (BearerManager.stop then a service teardown) must be a no-op, not a
+        // RejectedExecutionException on the already-shut executor.
+        if (exec.isShutdown) return
+        // Tear down ON `exec` (so the socket close + linkDown observe the same serial state), then shut
+        // the executor + OkHttp down AFTER that task runs. Prior bug: neither the single-thread executor
+        // nor the OkHttp dispatcher/connection pool were ever released, so every disable/enable leaked a
+        // "hop.relay.bearer" thread + OkHttp resources. shutdown() lets the queued teardown run first,
+        // then stops accepting new work; a live link still gets its linkDown.
         exec.execute {
             started = false
+            stableFuture?.cancel(false); stableFuture = null
             ws?.close(1001, "stop")
             ws = null
             if (up) { up = false; sink?.linkDown(linkId) }
         }
+        exec.shutdown()
+        // Release OkHttp's dispatcher thread pool + connection pool so a disable/enable cycle doesn't
+        // accumulate idle transport resources (the socket itself was closed on `exec` above).
+        client.dispatcher.executorService.shutdown()
+        client.connectionPool.evictAll()
     }
 
     override fun send(bytes: ByteArray, link: LinkId) {
         if (link != linkId) return
         ws?.send(ByteString.of(*bytes))   // one node packet = one WS binary frame; OkHttp send is thread-safe
     }
+
+    /// Test hook (bearer-relay unit tests): true once stop() has shut the reconnect executor down. Lets a
+    /// radio-free JVM test assert the leak fix (the executor is actually released on stop), since exec is
+    /// otherwise private and its thread would leak silently.
+    internal val isTornDown: Boolean get() = exec.isShutdown
 
     // ---- dial / down / reconnect (all on `exec`) ----
 

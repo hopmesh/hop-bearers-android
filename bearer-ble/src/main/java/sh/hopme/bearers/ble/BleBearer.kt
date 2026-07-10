@@ -658,7 +658,12 @@ internal class Central(
     /// `BluetoothGatt.refresh()` (reflection). Best-effort: invalidates a stale/empty cache so the
     /// next `discoverServices()` against the same device re-reads its services from scratch.
     private fun refreshGattCache(g: BluetoothGatt) {
+        // Best-effort: the hidden refresh() can vanish/throw on a given OEM ROM. Log the failure with
+        // context (which device, why) instead of swallowing it silently, so a stale-cache dial-timeout
+        // wedge on a specific handset is diagnosable from logcat rather than invisible.
+        val addr = runCatching { g.device.address }.getOrNull() ?: "?"
         runCatching { g.javaClass.getMethod("refresh").invoke(g) }
+            .onFailure { Log.w(TAG, "GATT cache refresh unavailable addr=$addr: ${it.javaClass.simpleName}: ${it.message}") }
     }
 
     private val gattCb = object : BluetoothGattCallback() {
