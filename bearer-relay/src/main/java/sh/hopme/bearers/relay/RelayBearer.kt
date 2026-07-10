@@ -15,6 +15,8 @@ import okhttp3.WebSocketListener
 import okio.ByteString
 import java.security.MessageDigest
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 
 // RelayBearer — the cloud-relay transport as its OWN library (depends only on :bearer-core). The Android
@@ -58,8 +60,28 @@ class RelayBearer(private val relayUrl: String) : Bearer {
         MessageDigest.getInstance("SHA-256").digest(relayUrl.toByteArray()).copyOf(16)
 
     private val client = OkHttpClient.Builder().build()
-    /// Serial home for all bearer state (callbacks hop here) + the backoff reconnect timer.
-    private val exec = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "hop.relay.bearer") }
+
+    private fun newExec(): ScheduledExecutorService =
+        Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "hop.relay.bearer") }
+
+    /// Serial home for all bearer state (callbacks hop here) + the backoff reconnect timer. A `var`
+    /// so a stopped-then-restarted bearer works: stop() shuts this down to release the thread (the
+    /// leak fix), and start() installs a FRESH one instead of being a permanent no-op. Pre-r5 this was
+    /// a `val` shut down on stop(), which released the thread but left start() a dead no-op and left
+    /// in-flight OkHttp callbacks throwing RejectedExecutionException onto the shut executor.
+    private var exec: ScheduledExecutorService = newExec()
+
+    /// Post a task onto a specific executor, dropping it if that executor has been shut down. OkHttp
+    /// delivers WebSocket callbacks on its own dispatcher threads, so a callback that races stop()
+    /// (or arrives from an old connection after a restart, targeting the old shut exec) must be a
+    /// silent no-op, never a RejectedExecutionException that tears down the dispatcher thread.
+    private fun postTo(ex: ScheduledExecutorService, task: () -> Unit) {
+        try {
+            ex.execute(task)
+        } catch (_: RejectedExecutionException) {
+            // bearer was stopped (this exec is shut): drop the racing callback
+        }
+    }
 
     private var ws: WebSocket? = null
     private var started = false
@@ -72,9 +94,10 @@ class RelayBearer(private val relayUrl: String) : Bearer {
     // ---- Bearer ----
 
     override fun start() {
-        // A stopped bearer is terminal (the manager registers a fresh instance on re-enable), so once
-        // exec is shut down start() is an intentional no-op rather than a RejectedExecutionException.
-        if (exec.isShutdown) return
+        // Restartable: if a prior stop() shut the executor down, install a fresh one so start() after
+        // stop() actually reconnects (pre-r5 this was a permanent no-op). A running bearer keeps its
+        // executor; the `if (started)` guard inside makes a redundant start() harmless.
+        if (exec.isShutdown) exec = newExec()
         exec.execute {
             if (started) return@execute
             started = true
@@ -99,10 +122,13 @@ class RelayBearer(private val relayUrl: String) : Bearer {
             ws = null
             if (up) { up = false; sink?.linkDown(linkId) }
         }
+        // Shut this bearer's serial executor so its "hop.relay.bearer" thread is released on every
+        // stop (the leak fix); the queued teardown above runs first, then no new work is accepted. A
+        // later start() installs a fresh executor. Evict the connection pool so the closed socket's
+        // resources are freed now. We do NOT shut down client.dispatcher.executorService: that pool is
+        // shared with a possible restart, and OkHttp reaps its own idle threads (~60s), so shutting it
+        // would break a restart's dial() without preventing a real leak.
         exec.shutdown()
-        // Release OkHttp's dispatcher thread pool + connection pool so a disable/enable cycle doesn't
-        // accumulate idle transport resources (the socket itself was closed on `exec` above).
-        client.dispatcher.executorService.shutdown()
         client.connectionPool.evictAll()
     }
 
@@ -121,29 +147,37 @@ class RelayBearer(private val relayUrl: String) : Bearer {
     private fun dial() {
         if (!started) return
         Log.i(TAG, "relay dial $relayUrl")
+        // Capture the executor this connection belongs to. All of its OkHttp callbacks post here via
+        // postTo(), so a callback racing stop() (or from this old connection after a restart onto a
+        // fresh exec) lands on the shut executor and is dropped, never a RejectedExecutionException.
+        val dialExec = exec
         ws = client.newWebSocket(Request.Builder().url(relayUrl).build(), object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) = run {
-                exec.execute {
+                postTo(dialExec) {
                     up = true
                     Log.i(TAG, "relay link-up peer=${peerId.toHex().take(8)}")
                     sink?.linkUp(linkId, HopRole.DIALER, peerId)   // dialer = Noise initiator
                     // F-13: reset backoff only after the link has been stable a while, not on open — a
                     // relay that accepts then immediately drops isn't then re-dialed at the 1s floor forever.
                     stableFuture?.cancel(false)
-                    stableFuture = exec.schedule(
-                        { if (up) { backoffMs = RELAY_BACKOFF_MIN_MS; deadStreak = 0 } }, // android-09: a stable link clears the dead streak
-                        RELAY_STABLE_MS, TimeUnit.MILLISECONDS,
-                    )
+                    stableFuture = try {
+                        dialExec.schedule(
+                            { if (up) { backoffMs = RELAY_BACKOFF_MIN_MS; deadStreak = 0 } }, // android-09: a stable link clears the dead streak
+                            RELAY_STABLE_MS, TimeUnit.MILLISECONDS,
+                        )
+                    } catch (_: RejectedExecutionException) {
+                        null // stopped between onOpen and the schedule: no stable-reset needed
+                    }
                 }
             }
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) = run {
-                exec.execute { sink?.linkBytes(linkId, bytes.toByteArray()) }
+                postTo(dialExec) { sink?.linkBytes(linkId, bytes.toByteArray()) }
             }
             override fun onMessage(webSocket: WebSocket, text: String) = run {
-                exec.execute { sink?.linkBytes(linkId, text.toByteArray()) }
+                postTo(dialExec) { sink?.linkBytes(linkId, text.toByteArray()) }
             }
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) = run {
-                exec.execute { Log.i(TAG, "relay closing: $code $reason"); down() }
+                postTo(dialExec) { Log.i(TAG, "relay closing: $code $reason"); down() }
             }
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) = run {
                 // F-13: honor a 429 Retry-After from the upgrade response instead of hammering.
@@ -152,7 +186,7 @@ class RelayBearer(private val relayUrl: String) : Bearer {
                 } else {
                     null
                 }
-                exec.execute {
+                postTo(dialExec) {
                     if (ra != null) { retryAfterMs = ra; Log.w(TAG, "relay 429 rate-limited; backing off ${ra}ms") }
                     else Log.w(TAG, "relay failed: ${t.message}")
                     down()

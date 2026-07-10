@@ -11,8 +11,8 @@ import org.junit.Test
  * android.util.Log until start()/dial()), so we can drive the lifecycle without a device.
  *
  * We assert the leak fix through the [RelayBearer.isTornDown] hook (exec.isShutdown) rather than by
- * counting threads, and that a stopped bearer degrades gracefully: start() is a no-op, send() can't
- * crash.
+ * counting threads, that a stopped bearer is RESTARTABLE (start() reinstalls a fresh executor rather
+ * than being a permanent no-op), and that a stopped bearer degrades gracefully: send() can't crash.
  */
 class RelayBearerLifecycleTest {
 
@@ -39,13 +39,17 @@ class RelayBearerLifecycleTest {
         assertTrue(b.isTornDown)
     }
 
-    @Test fun startAfterStopIsANoOpNotACrash() {
-        // A stopped bearer is terminal (the manager registers a fresh instance on re-enable). start()
-        // after stop() must be a guarded no-op, NOT a RejectedExecutionException from the dead executor.
+    @Test fun startAfterStopReinstallsAFreshExecutor() {
+        // r5 fix: a stopped bearer is RESTARTABLE. Pre-r5, stop() shut the executor down permanently
+        // so start() after stop() was a dead no-op (and in-flight OkHttp callbacks threw
+        // RejectedExecutionException onto the shut exec). start() must now install a fresh executor and
+        // bring the bearer back to life, without throwing.
         val b = newBearer()
         b.stop()
-        b.start()   // must not throw
-        assertTrue("still torn down after a post-stop start()", b.isTornDown)
+        assertTrue("torn down while stopped", b.isTornDown)
+        b.start()   // must not throw; reinstalls a live executor
+        assertFalse("start() after stop() brings the bearer back to life (fresh executor)", b.isTornDown)
+        b.stop()    // clean up the restarted bearer
     }
 
     @Test fun sendAfterStopDoesNotThrow() {
