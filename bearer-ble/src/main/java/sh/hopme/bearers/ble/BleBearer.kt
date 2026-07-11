@@ -70,9 +70,10 @@ internal val SERVICE_UUID: ParcelUuid = ParcelUuid.fromString("7ED70001-3C2A-4F1
 internal val ENDPOINT_CHAR: UUID = UUID.fromString("7ED70002-3C2A-4F19-9B8E-1A2B3C4D5E6F")
 internal const val MFG_ID = 0xFFFF
 
-// iBeacon (Layer C) — the iOS *relaunch* signal. Byte-matches iOS BeaconWake.swift BEACON_UUID.
-// Public so the app driver references THIS single value instead of redefining the literal (F-40).
-val BEACON_UUID: UUID = UUID.fromString("7ED7BEAC-3C2A-4F19-9B8E-1A2B3C4D5E6F") // == iOS BEACON_UUID
+// iBeacon (Layer C) constants + payload builder — BEACON_UUID and iBeaconPayload() live in the
+// Android-free BleBeacon.kt (like DialBackoff.kt / BleDedup.kt) so the pure iBeacon layout is
+// unit-testable on a plain JVM; this file's facade initializes Android-typed top-level vals (ParcelUuid)
+// that can't load under a stubbed android.jar. The const vals below stay here (they inline at use).
 internal const val APPLE_COMPANY_ID = 0x004C
 internal const val BEACON_CYCLE_MS = 300_000L   // ~5 min: floor for CoreLocation relaunch rate-limit
 internal const val BEACON_EXIT_GAP_MS = 35_000L // > iOS ~30 s exit-debounce, so stop→start makes a clean enter
@@ -84,16 +85,6 @@ internal const val HEAL_INTERVAL_S = 30L        // F-12: peripheral self-heal ca
 internal const val ADV_PROBE_MS = 180_000L      // ~3 min: force-recycle the connectable advertiser
 internal const val ADV_PROBE_GAP_MS = 1_500L    // brief stop→start gap so the controller drops the old set cleanly
 
-internal fun iBeaconPayload(uuid: UUID, major: Int, minor: Int, measuredPowerDbm: Int): ByteArray {
-    val b = java.nio.ByteBuffer.allocate(23)          // ByteBuffer is big-endian by default
-    b.put(0x02).put(0x15)                             // subtype + length(0x15=21)
-    b.putLong(uuid.mostSignificantBits)              // UUID high 8 bytes (network order)
-    b.putLong(uuid.leastSignificantBits)             // UUID low 8 bytes
-    b.putShort(major.toShort())                      // major BE
-    b.putShort(minor.toShort())                      // minor BE
-    b.put(measuredPowerDbm.toByte())                 // -59 -> 0xC5
-    return b.array()
-}
 internal const val PING_MS = 1000L
 internal const val DEAD_MS = 5000L
 internal const val DEAD_BG_MS = 15_000L

@@ -13,6 +13,8 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
+    // quality-cov: JVM unit-test line coverage (AGP wires jacoco + createDebugUnitTestCoverageReport).
+    buildTypes { debug { enableUnitTestCoverage = true } }
 }
 dependencies {
     implementation(project(":hop-sdk"))   // Bearer/LinkSink/HopRole contract + transport helpers
