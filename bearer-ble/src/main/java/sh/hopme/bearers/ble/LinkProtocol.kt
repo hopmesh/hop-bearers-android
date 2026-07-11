@@ -118,7 +118,7 @@ internal class LinkProtocol(
             while (!closed) {
                 readFully(hdr, 4)
                 val len = (hdr[0].i shl 24) or (hdr[1].i shl 16) or (hdr[2].i shl 8) or hdr[3].i
-                if (len < 1 || len > 4 * 1024 * 1024) {
+                if (len < 1 || len > MAX_FRAME_BYTES) {
                     close("bad len $len")
                     return
                 }

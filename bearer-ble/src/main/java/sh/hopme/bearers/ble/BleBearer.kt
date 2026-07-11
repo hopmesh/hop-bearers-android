@@ -85,6 +85,7 @@ internal const val HEAL_INTERVAL_S = 30L        // F-12: peripheral self-heal ca
 internal const val ADV_PROBE_MS = 180_000L      // ~3 min: force-recycle the connectable advertiser
 internal const val ADV_PROBE_GAP_MS = 1_500L    // brief stop→start gap so the controller drops the old set cleanly
 
+internal const val MAX_FRAME_BYTES = 4 * 1024 * 1024   // reject a length prefix over this (matches Apple MAX_FRAME / LAN_MAX_FRAME)
 internal const val PING_MS = 1000L
 internal const val DEAD_MS = 5000L
 internal const val DEAD_BG_MS = 15_000L
@@ -782,8 +783,11 @@ class BleBearer(private val ctx: Context, private val myId: ByteArray) : Bearer 
         val peer = link.peerId ?: return
         val key = peer.toHex()
         synchronized(lock) { linksByLinkId[link.linkId] = link } // register for send routing + down pairing
-        // Surface BEFORE dedup (Apple parity): both legs of a duplicate pair come up, then dedup closes
-        // the loser → the consumer sees that loser's linkDown.
+        // Surface this leg BEFORE dedup: both legs of a duplicate pair get a linkUp, then dedup closes the
+        // loser → the consumer sees that loser's linkDown. NOTE this DIFFERS from the Apple BLE bearer,
+        // which under apple-12 dedups BEFORE surfacing (its loser never reaches sink.linkUp). Left as-is
+        // here so the consumer-visible link events don't change; unifying on the Apple ordering (to avoid
+        // the doomed-handshake churn apple-12 fixed) is a deliberate follow-up, not a silent change here.
         sink?.linkUp(link.linkId, if (link.isDialer) HopRole.DIALER else HopRole.ACCEPTOR, peer)
         var drop: Link? = null
         synchronized(lock) {

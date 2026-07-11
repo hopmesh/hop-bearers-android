@@ -397,8 +397,10 @@ class LanBearer(private val ctx: Context, private val myId: ByteArray) : Bearer 
         val peer = link.peerId ?: return
         val key = peer.toHex()
         synchronized(lock) { linksByLinkId[link.linkId] = link } // register for send routing + down pairing
-        // Surface BEFORE dedup (Apple parity): both legs of a duplicate pair come up, then dedup closes
-        // the loser → the consumer sees that loser's linkDown.
+        // Surface this leg BEFORE dedup: both legs of a duplicate pair get a linkUp, then dedup closes the
+        // loser → the consumer sees that loser's linkDown. NOTE this DIFFERS from the Apple BLE bearer,
+        // which under apple-12 dedups BEFORE surfacing (its loser never reaches sink.linkUp). Left as-is so
+        // the consumer-visible link events don't change; unifying on the Apple ordering is a follow-up.
         sink?.linkUp(link.linkId, if (link.isDialer) HopRole.DIALER else HopRole.ACCEPTOR, peer)
         var drop: LanLink? = null
         synchronized(lock) {
