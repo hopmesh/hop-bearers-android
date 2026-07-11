@@ -52,6 +52,22 @@ class RelayBearerLifecycleTest {
         b.stop()    // clean up the restarted bearer
     }
 
+    @Test fun rapidRestartCyclesAreSafeAndQuiescent() {
+        // r6-01: stop() awaits the old executor's termination before returning, so a stop() -> start()
+        // sequence can never leave the old exec's teardown racing the new exec's dial(). Drive several
+        // rapid cycles; each must not throw, and after a trailing stop() the bearer is quiesced (torn
+        // down, old thread released) rather than left half-alive by a lost race.
+        val b = newBearer()
+        repeat(4) {
+            b.start()
+            b.stop()
+        }
+        assertTrue("bearer is quiesced after the final stop()", b.isTornDown)
+        b.start()
+        assertFalse("and still restartable", b.isTornDown)
+        b.stop()
+    }
+
     @Test fun sendAfterStopDoesNotThrow() {
         // No live socket after stop(); a stray send() on the dead link id must be a safe no-op.
         val b = newBearer()

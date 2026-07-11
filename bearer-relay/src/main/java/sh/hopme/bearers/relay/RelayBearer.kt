@@ -124,11 +124,17 @@ class RelayBearer(private val relayUrl: String) : Bearer {
         }
         // Shut this bearer's serial executor so its "hop.relay.bearer" thread is released on every
         // stop (the leak fix); the queued teardown above runs first, then no new work is accepted. A
-        // later start() installs a fresh executor. Evict the connection pool so the closed socket's
-        // resources are freed now. We do NOT shut down client.dispatcher.executorService: that pool is
-        // shared with a possible restart, and OkHttp reaps its own idle threads (~60s), so shutting it
-        // would break a restart's dial() without preventing a real leak.
+        // later start() installs a fresh executor. We do NOT shut down client.dispatcher.executorService:
+        // that pool is shared with a possible restart, and OkHttp reaps its own idle threads (~60s), so
+        // shutting it would break a restart's dial() without preventing a real leak.
         exec.shutdown()
+        // r6-01: BLOCK until the queued teardown task has actually finished before returning. Without
+        // this, a stop() -> start() sequence (BearerManager fans both out to the SAME instance) could
+        // leave the old exec's teardown running on one thread while the new exec's dial() runs on
+        // another, racing over the non-volatile started/up/ws/stableFuture state. awaitTermination
+        // makes stop() fully synchronous so start() always sees a quiesced bearer; the teardown task is
+        // a socket close + one linkDown, so it completes in well under the cap.
+        runCatching { exec.awaitTermination(2, TimeUnit.SECONDS) }
         client.connectionPool.evictAll()
     }
 
