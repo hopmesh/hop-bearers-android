@@ -1,3 +1,5 @@
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
 plugins {
     id("com.android.library")
     id("org.jetbrains.kotlin.android")
@@ -6,20 +8,23 @@ plugins {
 // bearer-relay - an INDEPENDENT Android bearer library depending only on the Kotlin SDK (sh.hop).
 android {
     namespace = "sh.hopme.bearers.relay"
-    compileSdk = 34
+    // okhttp-android's AAR metadata (okhttp 5.4.0, below) requires compileSdk >= 36 from every consumer.
+    compileSdk = 36
     defaultConfig { minSdk = 29 }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions { jvmTarget = "17" }
     // quality-cov: Robolectric shadows android.util.Log so the WebSocket callback bodies (which log on
     // every lifecycle edge) run under a plain JVM MockWebServer drive.
     testOptions { unitTests { isIncludeAndroidResources = true } }
 }
+// Kotlin 2.x makes `android.kotlinOptions { jvmTarget = ... }` a hard compile error (moved to
+// compilerOptions); this is the direct replacement, one level up from the `android {}` block.
+kotlin { compilerOptions { jvmTarget.set(JvmTarget.JVM_17) } }
 dependencies {
     implementation(project(":hop-sdk"))   // Bearer/LinkSink/HopRole contract + transport helpers
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("com.squareup.okhttp3:okhttp:5.4.0")
 
     // quality-net-03 / cov/android-bearers: pure-JVM unit tests for the reconnect/backoff schedule
     // (RelayBackoff.kt is Android-free), PLUS a Robolectric + MockWebServer drive of the REAL
@@ -27,7 +32,12 @@ dependencies {
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.robolectric:robolectric:4.13")
     testImplementation("androidx.test:core:1.6.1")
-    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
+    // OkHttp 5 split MockWebServer into a new `mockwebserver3` module + coordinate, but Square kept
+    // publishing this legacy `com.squareup.okhttp3:mockwebserver` artifact as a deprecated bridge over the
+    // OLD `okhttp3.mockwebserver` package (MockResponse/MockWebServer/WebSocket upgrade helpers unchanged),
+    // specifically so callers don't have to migrate immediately. RelayBearerSocketTest still imports
+    // okhttp3.mockwebserver.* unmodified.
+    testImplementation("com.squareup.okhttp3:mockwebserver:5.4.0")
 }
 
 // quality-cov / cov/android-bearers: line-coverage report + 80% floor over the relay bearer's OWN Kotlin.

@@ -1,3 +1,5 @@
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
 plugins {
     id("com.android.library")
     id("org.jetbrains.kotlin.android")
@@ -13,11 +15,13 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions { jvmTarget = "17" }
     // quality-cov: Robolectric loads android resources through the merged test config; keep them on so
     // the RobolectricTestRunner can build a real Application/Context (LanBearer needs a Context).
     testOptions { unitTests { isIncludeAndroidResources = true } }
 }
+// Kotlin 2.x makes `android.kotlinOptions { jvmTarget = ... }` a hard compile error (moved to
+// compilerOptions); this is the direct replacement, one level up from the `android {}` block.
+kotlin { compilerOptions { jvmTarget.set(JvmTarget.JVM_17) } }
 dependencies {
     implementation(project(":hop-sdk"))   // Bearer/LinkSink/HopRole contract + transport helpers
 
