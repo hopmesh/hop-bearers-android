@@ -140,6 +140,74 @@ class LanBearerLoopbackTest {
         assertTrue(waitUntil { recB.upCount() - recB.downCount() == 1 })
     }
 
+    /// The link id (from `ups`) that never got a matching `down`, plus the role it surfaced with.
+    private fun survivorRole(rec: Rec): HopRole {
+        val survivorId = rec.ups.map { it.first }.first { it !in rec.downs }
+        return rec.ups.first { it.first == survivorId }.second
+    }
+
+    // ---- F-3: pin the dedup keep-rule's arrival order so BOTH LanBearer.onUp() dispatch slots ------
+    // (DedupKeep.EXISTING / DedupKeep.INCOMING) are hit EVERY run, not just whichever one the real
+    // socket race happens to land on.
+    //
+    // mutualDialDedupKeepsOneSurvivor above starts both dials back-to-back with no ordering between
+    // them, so on each side, whichever of "my dial leg" / "my accept leg" completes its HELLO round
+    // trip first becomes `existing` in onUp()'s dedup map and the other becomes `incoming` - a genuine
+    // race between two independently-established TCP connections that depends on real thread/socket
+    // scheduling. LanDedup.decide() itself is a pure function and is already fully+deterministically
+    // covered above (LanWireTest / LanFrameDedupTest exercise every input combination directly), but
+    // the CALL SITE in onUp() (LanBearer.kt, the `when (LanDedup.decide(...)) { EXISTING -> ...;
+    // INCOMING -> ... }` dispatch) only runs through this integration path, so ITS branch coverage
+    // rode on that race: some CI runs happened to land EXISTING on both sides, some INCOMING on both,
+    // some a mix - flipping the covered line/branch set 94.4% vs 94.8% run to run (F-3).
+    //
+    // Fix: force the arrival order explicitly by waiting for the FIRST connection to be fully up on
+    // BOTH ends before starting the SECOND one, so `existing` is deterministically known before the
+    // dedup ever runs. Two tests, one per order, guarantee both slots are exercised every single run -
+    // and additionally assert the actual survivor identity (which the racy test above never checked),
+    // proving the keep-rule always preserves the SAME physical connection (the greater peer's dial)
+    // regardless of which slot the decision passed through.
+
+    @Test fun mutualDialConnection1FirstResolvesViaExistingSlot() {
+        val recA = Rec(); val recB = Rec()
+        val a = startedBearer(fill(0xF0), recA) // greater
+        val b = startedBearer(fill(0x01), recB) // lesser
+        // Connection 1 (A dials B) is fully up on BOTH ends before Connection 2 starts, so it is
+        // deterministically `existing` in onUp()'s dedup map on both sides when Connection 2 arrives.
+        a.dialForTest(svcFor(fill(0x01), b.boundPort))
+        assertTrue("A's dial leg up first", waitUntil { recA.upCount() == 1 })
+        assertTrue("B's accept leg up first", waitUntil { recB.upCount() == 1 })
+        // Connection 2 (B dials A) now arrives second on both sides -> greater-id A already holds its
+        // DIALED leg as `existing` (matches keepDialed) -> DedupKeep.EXISTING; lesser-id B already
+        // holds its ACCEPTED leg as `existing` (matches keepDialed=false) -> DedupKeep.EXISTING too.
+        b.dialForTest(svcFor(fill(0xF0), a.boundPort))
+        assertTrue("A saw both legs then dedup", waitUntil { recA.upCount() == 2 && recA.downCount() == 1 })
+        assertTrue("B saw both legs then dedup", waitUntil { recB.upCount() == 2 && recB.downCount() == 1 })
+        // The survivor is Connection 1 in both cases: A keeps its dial, B keeps its accept.
+        assertEquals("greater id's dialed leg survives", HopRole.DIALER, survivorRole(recA))
+        assertEquals("lesser id's accepted leg survives", HopRole.ACCEPTOR, survivorRole(recB))
+    }
+
+    @Test fun mutualDialConnection2FirstResolvesViaIncomingSlot() {
+        val recA = Rec(); val recB = Rec()
+        val a = startedBearer(fill(0xF0), recA) // greater
+        val b = startedBearer(fill(0x01), recB) // lesser
+        // Reverse the arrival order: Connection 2 (B dials A) is fully up on both ends FIRST, so it is
+        // deterministically `existing`; Connection 1 (A dials B) arrives second and is `incoming` ->
+        // the dedup keep-rule takes the INCOMING slot on both ends this time - the sibling branch F-3
+        // found flaky.
+        b.dialForTest(svcFor(fill(0xF0), a.boundPort))
+        assertTrue("B's dial leg up first", waitUntil { recB.upCount() == 1 })
+        assertTrue("A's accept leg up first", waitUntil { recA.upCount() == 1 })
+        a.dialForTest(svcFor(fill(0x01), b.boundPort))
+        assertTrue("A saw both legs then dedup", waitUntil { recA.upCount() == 2 && recA.downCount() == 1 })
+        assertTrue("B saw both legs then dedup", waitUntil { recB.upCount() == 2 && recB.downCount() == 1 })
+        // Same physical survivor regardless of arrival order: A's dial / B's accept (Connection 1),
+        // reached this time via the INCOMING slot instead of EXISTING.
+        assertEquals("greater id's dialed leg still survives", HopRole.DIALER, survivorRole(recA))
+        assertEquals("lesser id's accepted leg still survives", HopRole.ACCEPTOR, survivorRole(recB))
+    }
+
     // ---- raw peer drives LanLink.handle deterministically -----------------------------------------
 
     @Test fun rawPeerPingGetsPong() {
