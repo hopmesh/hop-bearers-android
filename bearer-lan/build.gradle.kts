@@ -30,7 +30,7 @@ dependencies {
     // loopback-socket integration tests of the REAL LanBearer/LanLink (link up/bytes/down, dedup survivor,
     // dial+accept, restart) once android.util.Log is shadowed.
     testImplementation("junit:junit:4.13.2")
-    testImplementation("org.robolectric:robolectric:4.13")
+    testImplementation("org.robolectric:robolectric:4.16.1")
     testImplementation("androidx.test:core:1.7.0")
 }
 
