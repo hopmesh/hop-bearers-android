@@ -31,7 +31,7 @@ dependencies {
     // dial+accept, restart) once android.util.Log is shadowed.
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.robolectric:robolectric:4.13")
-    testImplementation("androidx.test:core:1.6.1")
+    testImplementation("androidx.test:core:1.7.0")
 }
 
 // quality-cov / cov/android-bearers: line-coverage report + 80% floor over the LAN bearer's OWN Kotlin.
