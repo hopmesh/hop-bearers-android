@@ -15,6 +15,7 @@ import sh.hop.toHex
 import java.io.EOFException
 import java.net.InetAddress
 import java.net.Socket
+import java.net.SocketTimeoutException
 
 /**
  * cov/android-bearers: real loopback-socket integration tests of the LanBearer/LanLink transport, run
@@ -73,6 +74,10 @@ class LanBearerLoopbackTest {
         fun readFrameOfType(type: Int): LanFrame {
             repeat(8) { val f = readFrame(); if (f.type == type) return f }
             error("frame type $type not seen")
+        }
+        fun peerClosed(): Boolean {
+            sock.soTimeout = 50
+            return try { inp.read() < 0 } catch (_: SocketTimeoutException) { false }
         }
         fun close() = runCatching { sock.close() }
     }
@@ -241,6 +246,71 @@ class LanBearerLoopbackTest {
         val link = rec.ups.first().first
         raw.sendRaw(byteArrayOf(0, 0, 0, 0)) // declared length 0 is invalid → close("bad len 0")
         assertTrue("bad-length frame closes the link", waitUntil { rec.downs.contains(link) })
+    }
+
+    @Test fun pendingSlowPeersStopAtCapAndCleanupAdmitsAValidPeer() {
+        val rec = Rec()
+        val a = startedBearer(fill(0x80), rec)
+        val slow = List(LAN_MAX_PENDING_LINKS) { RawPeer(a.boundPort) }
+        assertTrue("all cap slots admitted", waitUntil { a.pendingLinkCount == LAN_MAX_PENDING_LINKS })
+
+        val overflow = RawPeer(a.boundPort)
+        assertTrue("cap+1 socket is closed by the bearer", waitUntil { overflow.peerClosed() })
+        assertEquals("cap+1 is closed without an admission lease", LAN_MAX_PENDING_LINKS, a.pendingLinkCount)
+
+        slow.first().close()
+        assertTrue("closing one hostile peer releases capacity", waitUntil { a.pendingLinkCount == LAN_MAX_PENDING_LINKS - 1 })
+        val valid = RawPeer(a.boundPort)
+        valid.sendHello(fill(0x33), dialer = true)
+        assertTrue("a valid peer links after hostile cleanup", waitUntil { rec.upCount() == 1 })
+    }
+
+    @Test fun aggregatePreauthBytesRejectBeforeFifthMaxFrameAllocationAndRecover() {
+        val rec = Rec()
+        val a = startedBearer(fill(0x80), rec)
+        val holding = List(4) { RawPeer(a.boundPort) }
+        holding.forEach { it.sendRaw(LanWire.lengthPrefix(LAN_MAX_FRAME)) }
+        assertTrue(
+            "four incomplete frames consume the aggregate byte budget",
+            waitUntil { a.retainedPreauthBytes == LAN_MAX_PREAUTH_BYTES_TOTAL },
+        )
+
+        val rejected = RawPeer(a.boundPort)
+        rejected.sendRaw(LanWire.lengthPrefix(LAN_MAX_FRAME))
+        assertTrue("aggregate exhaustion closes cap+1 allocation", waitUntil { rejected.peerClosed() })
+        assertEquals(holding.size, a.pendingLinkCount)
+
+        holding.forEach { it.close() }
+        assertTrue("hostile frame cleanup releases every byte", waitUntil { a.retainedPreauthBytes == 0 && a.pendingLinkCount == 0 })
+        val valid = RawPeer(a.boundPort)
+        valid.sendHello(fill(0x44), dialer = true)
+        assertTrue(waitUntil { rec.upCount() == 1 })
+    }
+
+    @Test fun oversizedAnnouncedFrameClosesBeforeBodyAndNextPeerLinks() {
+        val rec = Rec()
+        val a = startedBearer(fill(0x80), rec)
+        val hostile = RawPeer(a.boundPort)
+        hostile.sendRaw(LanWire.lengthPrefix(LAN_MAX_FRAME + 1))
+        assertTrue("oversized declared body closes before body bytes", waitUntil { hostile.peerClosed() })
+        assertTrue("oversized declared length releases its link", waitUntil { a.pendingLinkCount == 0 })
+        assertEquals(0, a.retainedPreauthBytes)
+
+        val valid = RawPeer(a.boundPort)
+        valid.sendHello(fill(0x55), dialer = true)
+        assertTrue(waitUntil { rec.upCount() == 1 })
+    }
+
+    @Test fun noHelloTimeoutReleasesAdmissionForNextPeer() {
+        val rec = Rec()
+        val a = startedBearer(fill(0x80), rec)
+        RawPeer(a.boundPort)
+        assertTrue(waitUntil { a.pendingLinkCount == 1 })
+        assertTrue("the shared scheduler reaps a stalled preauth link", waitUntil(7000) { a.pendingLinkCount == 0 })
+
+        val valid = RawPeer(a.boundPort)
+        valid.sendHello(fill(0x66), dialer = true)
+        assertTrue(waitUntil { rec.upCount() == 1 })
     }
 
     @Test fun rawPeerShortHelloDoesNotLinkUp() {

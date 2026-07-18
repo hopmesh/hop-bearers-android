@@ -8,6 +8,8 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import sh.hop.nodeIdGreater
 import sh.hop.toHex
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * quality-net-03: LAN bearer wire codec + one-pipe-per-peer dedup keep-rule.
@@ -37,10 +39,62 @@ class LanWireTest {
     }
 
     @Test fun rejectsOutOfRangeLengths() {
+        assertEquals("the LAN wire cap is the protocol's 1 MiB cap", 1 shl 20, LAN_MAX_FRAME)
         assertFalse("zero-length body is invalid", LanWire.isValidLength(0))
         assertFalse("over-cap body is invalid", LanWire.isValidLength(LAN_MAX_FRAME + 1))
         assertTrue(LanWire.isValidLength(1))
         assertTrue(LanWire.isValidLength(LAN_MAX_FRAME))
+    }
+
+    @Test fun globalAdmissionCapsLinksAndAggregateBytesBeforeAllocation() {
+        val admission = LanAdmission(maxLinks = 3, maxBytesPerLink = 10, maxBytesTotal = 15)
+        val a = admission.tryAcquire()!!
+        val b = admission.tryAcquire()!!
+        val c = admission.tryAcquire()!!
+        assertNull("cap+1 link is rejected", admission.tryAcquire())
+
+        assertTrue(a.tryReserve(10))
+        assertTrue(b.tryReserve(5))
+        assertFalse("aggregate exhaustion rejects before allocation", c.tryReserve(1))
+        assertFalse("per-link budget rejects growth", b.tryReserve(6))
+        assertEquals(15, admission.retainedBytes)
+
+        a.close()
+        a.close()
+        assertEquals("idempotent cleanup releases all retained bytes once", 5, admission.retainedBytes)
+        assertTrue(c.tryReserve(10))
+        assertEquals(15, admission.retainedBytes)
+        b.release(5)
+        b.close()
+        c.close()
+        assertEquals(0, admission.linkCount)
+        assertEquals(0, admission.retainedBytes)
+    }
+
+    @Test fun concurrentSlowPeersStopExactlyAtTheGlobalCap() {
+        val admission = LanAdmission(maxLinks = LAN_MAX_PENDING_LINKS, maxBytesPerLink = 1, maxBytesTotal = LAN_MAX_PENDING_LINKS)
+        val ready = CountDownLatch(LAN_MAX_PENDING_LINKS * 2)
+        val start = CountDownLatch(1)
+        val acquired = AtomicInteger()
+        val leases = java.util.Collections.synchronizedList(ArrayList<LanAdmission.Lease>())
+        val threads = List(LAN_MAX_PENDING_LINKS * 2) {
+            Thread {
+                ready.countDown()
+                start.await()
+                admission.tryAcquire()?.let { lease ->
+                    acquired.incrementAndGet()
+                    leases.add(lease)
+                }
+            }.also { it.start() }
+        }
+        ready.await()
+        start.countDown()
+        threads.forEach { it.join() }
+
+        assertEquals(LAN_MAX_PENDING_LINKS, acquired.get())
+        assertEquals(LAN_MAX_PENDING_LINKS, admission.linkCount)
+        leases.forEach { it.close() }
+        assertEquals(0, admission.linkCount)
     }
 
     // ---- HELLO round-trips id + role ----------------------------------------

@@ -17,10 +17,17 @@ import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.ScheduledThreadPoolExecutor
+import java.util.concurrent.SynchronousQueue
+import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
-import kotlin.concurrent.thread
+import java.util.concurrent.atomic.AtomicBoolean
 
 // LanBearer - the LAN transport as its OWN library (depends only on :bearer-core). Two devices on the
 // same Wi-Fi/LAN discover each other over NSD/Bonjour (`_hoplan._tcp`) and talk over TCP. It is fully
@@ -65,6 +72,9 @@ internal class LanLink(
     private val onUp: (LanLink) -> Unit,
     private val onData: (LanLink, ByteArray) -> Unit,
     private val onClose: (LanLink) -> Unit,
+    private val admission: LanAdmission.Lease,
+    private val readExecutor: ExecutorService,
+    private val scheduler: ScheduledExecutorService,
 ) {
     @Volatile
     var peerId: ByteArray? = null
@@ -78,20 +88,32 @@ internal class LanLink(
     private var txSeq = 0L
     private var rxSeq = 0L
 
-    @Volatile
-    private var closed = false
+    private val closed = AtomicBoolean(false)
     private val out: OutputStream = socket.getOutputStream()
     private val inp: InputStream = socket.getInputStream()
     private val writeLock = Any()
-    private val sched: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
+    @Volatile
+    private var tickTask: ScheduledFuture<*>? = null
 
     fun start() {
         runCatching { socket.tcpNoDelay = true }
         // HELLO first (same grammar as BLE/Apple): [0x01][16B nodeId][1B role][1B flags]
         sendFrame(LanWire.hello(myId, isDialer))
+        if (closed.get()) return
         Log.i(TAG, "lan channel-ready isDialer=$isDialer - sent HELLO")
-        thread(name = "lan-rx") { readLoop() }
-        sched.scheduleAtFixedRate({ tick() }, LAN_PING_MS, LAN_PING_MS, TimeUnit.MILLISECONDS)
+        try {
+            readExecutor.execute { readLoop() }
+            val task = scheduler.scheduleAtFixedRate(
+                { runCatching { tick() }.onFailure { close("tick: ${it.message}") } },
+                LAN_PING_MS,
+                LAN_PING_MS,
+                TimeUnit.MILLISECONDS,
+            )
+            tickTask = task
+            if (closed.get()) task.cancel(false)
+        } catch (_: RejectedExecutionException) {
+            close("executor capacity")
+        }
     }
 
     private fun tick() {
@@ -104,12 +126,13 @@ internal class LanLink(
 
     /// Bearer.send entry point: wrap the consumer's application bytes in a DATA frame (0x10) and send.
     fun sendData(bytes: ByteArray) {
-        if (closed) return
+        if (closed.get()) return
         sendFrame(LanWire.data(bytes))
     }
 
     private fun sendFrame(body: ByteArray) {
-        if (closed) return
+        if (closed.get()) return
+        if (!LanWire.isValidLength(body.size)) { close("outbound len ${body.size}"); return }
         val hdr = LanWire.lengthPrefix(body.size)
         try {
             synchronized(writeLock) { out.write(hdr); out.write(body); out.flush() }
@@ -121,17 +144,25 @@ internal class LanLink(
     private fun readLoop() {
         val hdr = ByteArray(4)
         try {
-            while (!closed) {
+            while (!closed.get()) {
                 readFully(hdr, 4)
                 val len = LanWire.readLength(hdr)
                 if (!LanWire.isValidLength(len)) { close("bad len $len"); return }
-                val body = ByteArray(len)
-                readFully(body, len)
-                lastRxMs = System.currentTimeMillis()
-                handle(body)
+                if (!admission.tryReserve(len)) { close("preauth byte budget"); return }
+                try {
+                    // The declared length is admitted globally and per-link before allocating its body.
+                    val body = ByteArray(len)
+                    readFully(body, len)
+                    lastRxMs = System.currentTimeMillis()
+                    handle(body)
+                } finally {
+                    admission.release(len)
+                }
             }
         } catch (e: IOException) {
             close("read: ${e.message}")
+        } catch (e: RuntimeException) {
+            close("callback: ${e.message}")
         }
     }
 
@@ -164,12 +195,12 @@ internal class LanLink(
     }
 
     fun close(why: String) {
-        if (closed) return
-        closed = true
+        if (!closed.compareAndSet(false, true)) return
         Log.i(TAG, "lan link-down ($why) peer=${peerId?.toHex()?.take(8)} isDialer=$isDialer")
-        sched.shutdownNow()
+        tickTask?.cancel(false)
         try { socket.close() } catch (_: IOException) {}
-        onClose(this)
+        admission.close()
+        runCatching { onClose(this) }
     }
 }
 
@@ -182,6 +213,7 @@ class LanBearer(private val ctx: Context, private val myId: ByteArray) : Bearer 
     private val lock = Any()
     private val linksByPeerId = HashMap<String, LanLink>()  // dedup: one survivor per peer
     private val linksByLinkId = HashMap<Long, LanLink>()     // send routing + linkUp/linkDown pairing
+    private val allLinksByLinkId = HashMap<Long, LanLink>()  // includes pre-HELLO and active links
     private val dialing = HashSet<String>()                  // peerId-hex currently being dialed (pre-HELLO dedup)
     private var nextLinkId = 1L
 
@@ -205,6 +237,11 @@ class LanBearer(private val ctx: Context, private val myId: ByteArray) : Bearer 
     // the scheduleAtFixedRate below. This mirrors RelayBearer's r5 restartable-executor fix - a
     // BearerManager disable→enable calls stop() then start() on the SAME instance.
     private var retryExec: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
+    private var controlExec: ExecutorService = Executors.newSingleThreadExecutor()
+    private var acceptExec: ExecutorService = Executors.newSingleThreadExecutor()
+    private var connectExec: ExecutorService = newConnectExecutor()
+    private var readExec: ExecutorService = newReadExecutor()
+    private var linkScheduler: ScheduledThreadPoolExecutor = newLinkScheduler()
 
     @Volatile
     private var stopped = false
@@ -214,13 +251,48 @@ class LanBearer(private val ctx: Context, private val myId: ByteArray) : Bearer 
 
     private val myHex = myId.toHex()
 
+    private fun newConnectExecutor(): ExecutorService = ThreadPoolExecutor(
+        4,
+        4,
+        0L,
+        TimeUnit.MILLISECONDS,
+        ArrayBlockingQueue(LAN_MAX_PENDING_LINKS),
+        ThreadPoolExecutor.AbortPolicy(),
+    )
+
+    private fun newReadExecutor(): ExecutorService = ThreadPoolExecutor(
+        LAN_MAX_PENDING_LINKS,
+        LAN_MAX_PENDING_LINKS,
+        0L,
+        TimeUnit.MILLISECONDS,
+        SynchronousQueue(),
+        ThreadPoolExecutor.AbortPolicy(),
+    )
+
+    private fun newLinkScheduler() = ScheduledThreadPoolExecutor(2).apply {
+        removeOnCancelPolicy = true
+    }
+
+    private fun ensureExecutors() {
+        if (controlExec.isShutdown) controlExec = Executors.newSingleThreadExecutor()
+        if (acceptExec.isShutdown) acceptExec = Executors.newSingleThreadExecutor()
+        if (connectExec.isShutdown) connectExec = newConnectExecutor()
+        if (readExec.isShutdown) readExec = newReadExecutor()
+        if (linkScheduler.isShutdown) linkScheduler = newLinkScheduler()
+    }
+
     override fun start() {
         stopped = false
         // Restartable: a prior stop() shut retryExec down, so reinstall a fresh one (else the schedule
         // below throws RejectedExecutionException). A never-stopped bearer keeps its live executor.
         if (retryExec.isShutdown) retryExec = Executors.newSingleThreadScheduledExecutor()
+        ensureExecutors()
         Log.i(TAG, "lan node-start myId=$myHex service=$LAN_SERVICE_TYPE")
-        thread(name = "lan-start") { startListener(); startNsd() }
+        try {
+            controlExec.execute { startListener(); startNsd() }
+        } catch (_: RejectedExecutionException) {
+            stopped = true
+        }
         retryExec.scheduleAtFixedRate({ runCatching { rescan() } }, LAN_RETRY_S, LAN_RETRY_S, TimeUnit.SECONDS)
     }
 
@@ -231,10 +303,15 @@ class LanBearer(private val ctx: Context, private val myId: ByteArray) : Bearer 
         regListener?.let { runCatching { n?.unregisterService(it) } }; regListener = null
         discListener?.let { runCatching { n?.stopServiceDiscovery(it) } }; discListener = null
         nsd = null
-        runCatching { server?.close() }; server = null
+        runCatching { server?.close() }; server = null; port = 0
         synchronized(lock) { knownServices.clear() }
-        val all = synchronized(lock) { linksByPeerId.values.toList() }
+        val all = synchronized(lock) { allLinksByLinkId.values.toList() }
         all.forEach { it.close("stop") }
+        controlExec.shutdownNow()
+        acceptExec.shutdownNow()
+        connectExec.shutdownNow()
+        readExec.shutdownNow()
+        linkScheduler.shutdownNow()
     }
 
     // F-14: re-dial any peer we've seen but aren't linked to / already dialing. Covers a peer lost to a
@@ -264,6 +341,40 @@ class LanBearer(private val ctx: Context, private val myId: ByteArray) : Bearer 
 
     private fun mint(): Long = synchronized(lock) { val id = nextLinkId; nextLinkId += 1; id }
 
+    private fun startSocketLink(
+        sock: Socket,
+        isDialer: Boolean,
+        lease: LanAdmission.Lease? = LAN_ADMISSION.tryAcquire(),
+        closed: (LanLink) -> Unit = ::onClose,
+    ): Boolean {
+        if (lease == null || stopped) {
+            lease?.close()
+            runCatching { sock.close() }
+            return false
+        }
+        val link = try {
+            LanLink(
+                sock,
+                mint(),
+                isDialer,
+                myId,
+                ::onUp,
+                ::onData,
+                closed,
+                lease,
+                readExec,
+                linkScheduler,
+            )
+        } catch (_: IOException) {
+            lease.close()
+            runCatching { sock.close() }
+            return false
+        }
+        synchronized(lock) { allLinksByLinkId[link.linkId] = link }
+        link.start()
+        return true
+    }
+
     // One TCP server accepts every inbound link; the OS picks an ephemeral port that NSD then advertises.
     private fun startListener() {
         try {
@@ -273,7 +384,7 @@ class LanBearer(private val ctx: Context, private val myId: ByteArray) : Bearer 
             server = s
             port = s.localPort
             Log.i(TAG, "lan listening port=$port name=${myHex.take(8)}")
-            thread(name = "lan-accept") {
+            acceptExec.execute {
                 while (true) {
                     val sock = try {
                         s.accept()
@@ -282,11 +393,15 @@ class LanBearer(private val ctx: Context, private val myId: ByteArray) : Bearer 
                         break
                     }
                     Log.i(TAG, "lan inbound-connection (acceptor)")
-                    LanLink(sock, mint(), isDialer = false, myId, ::onUp, ::onData, ::onClose).start()
+                    startSocketLink(sock, isDialer = false)
                 }
             }
         } catch (e: IOException) {
             Log.w(TAG, "lan listener bind failed: ${e.message}")
+        } catch (e: RejectedExecutionException) {
+            runCatching { server?.close() }
+            server = null
+            port = 0
         }
     }
 
@@ -375,19 +490,31 @@ class LanBearer(private val ctx: Context, private val myId: ByteArray) : Bearer 
         val peerHex = peerId.toHex()
         val host = svc.host ?: run { synchronized(lock) { dialing.remove(peerHex) }; return }
         val p = svc.port
-        thread(name = "lan-dial") {
-            val sock = try {
-                Socket().apply { connect(InetSocketAddress(host, p), LAN_DIAL_TIMEOUT_MS) }
-            } catch (e: IOException) {
-                Log.w(TAG, "lan dial failed peer=${peerHex.take(8)}: ${e.message}")
-                synchronized(lock) { dialing.remove(peerHex) }
-                return@thread
+        val lease = LAN_ADMISSION.tryAcquire() ?: run {
+            synchronized(lock) { dialing.remove(peerHex) }
+            return
+        }
+        try {
+            connectExec.execute {
+                val sock = try {
+                    Socket().apply { connect(InetSocketAddress(host, p), LAN_DIAL_TIMEOUT_MS) }
+                } catch (e: IOException) {
+                    Log.w(TAG, "lan dial failed peer=${peerHex.take(8)}: ${e.message}")
+                    synchronized(lock) { dialing.remove(peerHex) }
+                    lease.close()
+                    return@execute
+                }
+                Log.i(TAG, "lan dialed peer=${peerHex.take(8)} - wrapping link")
+                startSocketLink(
+                    sock,
+                    isDialer = true,
+                    lease = lease,
+                    closed = { l -> synchronized(lock) { dialing.remove(peerHex) }; onClose(l) },
+                )
             }
-            Log.i(TAG, "lan dialed peer=${peerHex.take(8)} - wrapping link")
-            LanLink(
-                sock, mint(), isDialer = true, myId, ::onUp, ::onData,
-                onClose = { l -> synchronized(lock) { dialing.remove(peerHex) }; onClose(l) },
-            ).start()
+        } catch (_: RejectedExecutionException) {
+            synchronized(lock) { dialing.remove(peerHex) }
+            lease.close()
         }
     }
 
@@ -430,6 +557,7 @@ class LanBearer(private val ctx: Context, private val myId: ByteArray) : Bearer 
         val peer = link.peerId
         val wasUp: Boolean
         synchronized(lock) {
+            allLinksByLinkId.remove(link.linkId)
             wasUp = linksByLinkId.remove(link.linkId) != null // true iff linkUp had fired
             if (peer != null) {
                 val key = peer.toHex()
@@ -447,6 +575,9 @@ class LanBearer(private val ctx: Context, private val myId: ByteArray) : Bearer 
     /// The ephemeral port the listener bound to (0 until startListener() has run). Lets a test connect a
     /// real loopback client to drive the accept leg, or hand another bearer this port to dial.
     internal val boundPort: Int get() = port
+
+    internal val pendingLinkCount: Int get() = LAN_ADMISSION.linkCount
+    internal val retainedPreauthBytes: Int get() = LAN_ADMISSION.retainedBytes
 
     /// Drive the discovery gate (skip-self, remember-for-rescan, greater-id-dials, in-flight dedup) with a
     /// fabricated NsdServiceInfo, exactly as onServiceFound would.

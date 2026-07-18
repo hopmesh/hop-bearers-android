@@ -17,7 +17,60 @@ internal const val L_PING = 0x02
 internal const val L_PONG = 0x03
 internal const val L_DATA = 0x10
 
-internal const val LAN_MAX_FRAME = 4 * 1024 * 1024
+internal const val LAN_MAX_FRAME = 1 shl 20
+internal const val LAN_MAX_PENDING_LINKS = 32
+internal const val LAN_MAX_PREAUTH_BYTES_PER_LINK = LAN_MAX_FRAME
+internal const val LAN_MAX_PREAUTH_BYTES_TOTAL = 4 * LAN_MAX_FRAME
+
+/**
+ * Process-wide preauthentication admission. LAN cannot observe Noise completion, so a link lease is
+ * retained until link close; frame bytes remain reserved until parsing and the consumer callback finish.
+ */
+internal class LanAdmission(
+    private val maxLinks: Int = LAN_MAX_PENDING_LINKS,
+    private val maxBytesPerLink: Int = LAN_MAX_PREAUTH_BYTES_PER_LINK,
+    private val maxBytesTotal: Int = LAN_MAX_PREAUTH_BYTES_TOTAL,
+) {
+    private val lock = Any()
+    private val held = java.util.IdentityHashMap<Lease, Int>()
+    private var bytes = 0
+
+    inner class Lease internal constructor() {
+        fun tryReserve(amount: Int): Boolean = synchronized(lock) {
+            val current = held[this] ?: return@synchronized false
+            if (amount < 0 || current + amount > maxBytesPerLink || bytes + amount > maxBytesTotal) {
+                return@synchronized false
+            }
+            held[this] = current + amount
+            bytes += amount
+            true
+        }
+
+        fun release(amount: Int) = synchronized(lock) {
+            val current = held[this] ?: return@synchronized
+            val released = amount.coerceIn(0, current)
+            held[this] = current - released
+            bytes -= released
+        }
+
+        fun close() = synchronized(lock) {
+            val retained = held.remove(this) ?: return@synchronized
+            bytes -= retained
+        }
+
+        val retainedBytes: Int get() = synchronized(lock) { held[this] ?: 0 }
+    }
+
+    fun tryAcquire(): Lease? = synchronized(lock) {
+        if (held.size >= maxLinks) return@synchronized null
+        Lease().also { held[it] = 0 }
+    }
+
+    val linkCount: Int get() = synchronized(lock) { held.size }
+    val retainedBytes: Int get() = synchronized(lock) { bytes }
+}
+
+internal val LAN_ADMISSION = LanAdmission()
 
 /// One decoded frame. `payload` excludes the 1-byte type tag.
 internal data class LanFrame(val type: Int, val payload: ByteArray) {
