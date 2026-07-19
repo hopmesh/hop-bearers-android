@@ -9,7 +9,7 @@ plugins {
 // the Kotlin SDK (sh.hop). The Android mirror of bearers/apple/HopBearerLan.
 android {
     namespace = "sh.hopme.bearers.lan"
-    compileSdk = 34
+    compileSdk = 37 // aligned across both builds; core-ktx 1.19.0 requires >= 37 from every consumer
     defaultConfig { minSdk = 29 }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

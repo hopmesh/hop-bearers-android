@@ -8,8 +8,8 @@ plugins {
 // bearer-relay - an INDEPENDENT Android bearer library depending only on the Kotlin SDK (sh.hop).
 android {
     namespace = "sh.hopme.bearers.relay"
-    // okhttp-android's AAR metadata (okhttp 5.4.0, below) requires compileSdk >= 36 from every consumer.
-    compileSdk = 36
+    // okhttp 5.4.0 requires compileSdk >= 36 and core-ktx 1.19.0 requires >= 37 from every consumer.
+    compileSdk = 37
     defaultConfig { minSdk = 29 }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

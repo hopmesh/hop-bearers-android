@@ -8,7 +8,7 @@ plugins {
 // bearer-ble - an INDEPENDENT Android bearer library depending only on the Kotlin SDK (sh.hop).
 android {
     namespace = "sh.hopme.bearers.ble"
-    compileSdk = 34
+    compileSdk = 37 // aligned across both builds; core-ktx 1.19.0 requires >= 37 from every consumer
     defaultConfig { minSdk = 29 }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
