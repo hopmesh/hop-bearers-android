@@ -3,7 +3,7 @@ plugins {
     `java-library`
 }
 // The Kotlin SDK (sh.hop) compiled as a plain JVM library so Android bearer modules can depend on it.
-// Points at the SHARED source under sdk/android (one source of truth — no copy). JNA is `api`
+// Points at the SHARED source under sdk/android (one source of truth, no copy). JNA is `api`
 // so HopNode can load libhop.so at runtime; bearers only use the Bearer/LinkSink/HopRole contract.
 sourceSets["main"].java.srcDir("../../../sdk/android/src/main/kotlin")
 kotlin { jvmToolchain(17) }

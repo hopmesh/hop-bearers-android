@@ -10,7 +10,7 @@ import org.junit.Test
  * BOTH ends must independently choose the SAME survivor or they close opposite legs and thrash.
  *
  * These pin the invariant: the greater-nodeId side keeps ITS dialed channel; the lesser-id side keeps
- * the channel it ACCEPTED (which is the greater side's dialed one) — so the two ends agree.
+ * the channel it ACCEPTED (which is the greater side's dialed one), so the two ends agree.
  */
 class BleDedupTest {
 
@@ -40,18 +40,18 @@ class BleDedupTest {
         val aKeepsDialed = BleDedup.decide(amGreater = true, existingIsDialer = true, incomingIsDialer = false)
         val bKeepsAccepted = BleDedup.decide(amGreater = false, existingIsDialer = false, incomingIsDialer = true)
         assertEquals(BleDedupKeep.EXISTING, aKeepsDialed)   // A keeps A→B (its dialer)
-        assertEquals(BleDedupKeep.EXISTING, bKeepsAccepted) // B keeps A→B (its acceptor) — SAME channel
+        assertEquals(BleDedupKeep.EXISTING, bKeepsAccepted) // B keeps A→B (its acceptor), SAME channel
     }
 
     @Test fun degenerateNoMatchFallsBackToIncoming() {
         // If neither competing link's role matches the keep rule (shouldn't happen for a real
-        // dialer/acceptor pair), fall back to the incoming link — matching BleBearer.onUp's `?: link`.
+        // dialer/acceptor pair), fall back to the incoming link, matching BleBearer.onUp's `?: link`.
         val keep = BleDedup.decide(amGreater = true, existingIsDialer = false, incomingIsDialer = false)
         assertEquals(BleDedupKeep.INCOMING, keep)
     }
 
     @Test fun degenerateBothMatchKeepsExisting() {
-        // If BOTH roles match (also degenerate), keep existing — matching the old firstOrNull(existing-first).
+        // If BOTH roles match (also degenerate), keep existing, matching the old firstOrNull(existing-first).
         val keep = BleDedup.decide(amGreater = true, existingIsDialer = true, incomingIsDialer = true)
         assertEquals(BleDedupKeep.EXISTING, keep)
     }

@@ -7,7 +7,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * quality-cov: the two remaining pure seams the wire tests didn't reach — LanFrame's content-based
+ * quality-cov: the two remaining pure seams the wire tests didn't reach, LanFrame's content-based
  * equals/hashCode (it carries a mutable ByteArray, so it hand-rolls them) and LanDedup's DEGENERATE
  * fallbacks (both competing links share a role, or neither matches the keep rule). The degenerate
  * branches shouldn't happen for a real dialer/acceptor pair, but they must still resolve

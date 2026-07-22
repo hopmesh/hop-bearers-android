@@ -1,6 +1,6 @@
 package sh.hopme.bearers.ble
 
-// R7 dial backoff — deliberately in its own Android-free file so the schedule is unit-testable (the
+// R7 dial backoff, deliberately in its own Android-free file so the schedule is unit-testable (the
 // rest of BleBearer.kt initializes Android-typed top-level vals like ParcelUuid, whose file facade
 // class can't load under a stubbed android.jar in a JVM unit test).
 //

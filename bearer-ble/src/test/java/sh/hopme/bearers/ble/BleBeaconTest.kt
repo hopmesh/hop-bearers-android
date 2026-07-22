@@ -25,7 +25,7 @@ class BleBeaconTest {
         // [0..1] iBeacon subtype (0x02) + length (0x15 = 21).
         assertEquals(0x02.toByte(), payload[0])
         assertEquals(0x15.toByte(), payload[1])
-        // [2..17] the 128-bit UUID in network (big-endian) order — high 8 bytes then low 8 bytes.
+        // [2..17] the 128-bit UUID in network (big-endian) order, high 8 bytes then low 8 bytes.
         val expectedUuid = byteArrayOf(
             0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
             0x88.toByte(), 0x99.toByte(), 0xaa.toByte(), 0xbb.toByte(),

@@ -8,7 +8,7 @@ package sh.hopme.bearers.ble
 
 import java.util.UUID
 
-// iBeacon (Layer C) — the iOS *relaunch* signal. Byte-matches iOS BeaconWake.swift BEACON_UUID.
+// iBeacon (Layer C), the iOS *relaunch* signal. Byte-matches iOS BeaconWake.swift BEACON_UUID.
 // Public so the app driver references THIS single value instead of redefining the literal (F-40).
 val BEACON_UUID: UUID = UUID.fromString("7ED7BEAC-3C2A-4F19-9B8E-1A2B3C4D5E6F") // == iOS BEACON_UUID
 

@@ -19,23 +19,23 @@ import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 
-// RelayBearer — the cloud-relay transport as its OWN library (depends only on :bearer-core). The Android
+// RelayBearer, the cloud-relay transport as its OWN library (depends only on :bearer-core). The Android
 // mirror of apple/HopBearers' RelayBearer. It is the SIMPLEST bearer: ONE outbound WebSocket to the
 // backbone relay, no peer discovery, no HELLO, no length framing (a WS message already frames exactly one
 // node packet), no keepalive/dedup. The relay's lifecycle maps 1:1 to a single node link:
 //
 //   - start()  -> dial the relay over an OkHttp WebSocket.
-//   - onOpen   -> sink.linkUp(linkId, DIALER, peerId) — we dialed, so we're the Noise initiator.
-//   - onMessage-> sink.linkBytes(linkId, bytes) — one WS frame = one node packet.
+//   - onOpen   -> sink.linkUp(linkId, DIALER, peerId): we dialed, so we're the Noise initiator.
+//   - onMessage-> sink.linkBytes(linkId, bytes): one WS frame = one node packet.
 //   - onClosing/onFailure -> sink.linkDown(linkId) + reconnect with exponential backoff (the device
 //     "check-in" that pulls queued mail and stays reachable across the internet).
 //   - send     -> ws.send(bytes).
 //   - stop()   -> close the socket; the sink gets linkDown for the live link.
 //
 // The node identifies the relay via Noise over this link, so the consumer needs no real peer identity
-// from the transport — only a STABLE synthetic peerId for the BearerManager's bookkeeping. We derive it
+// from the transport, just a STABLE synthetic peerId for the BearerManager's bookkeeping. We derive it
 // deterministically from the relay URL (SHA-256 prefix) so it's identical every reconnect; the node
-// ignores it. Names nothing about BLE/LAN — written purely against start/stop/send/sink.
+// ignores it. Names nothing about BLE/LAN, written purely against start/stop/send/sink.
 //
 // THREADING: OkHttp delivers WebSocketListener callbacks from its own dispatcher threads; we hop each
 // onto a single-thread executor so all bearer state lives on one thread (no locks). OkHttp's send is
@@ -50,11 +50,11 @@ class RelayBearer(private val relayUrl: String) : Bearer {
     /// Short transport tag for the consumer's UI (Bearer contract). The cloud relay link surfaces as "Relay".
     override val transportName = "Relay"
 
-    /// ONE link — one WebSocket. The BearerManager translates this local id into its global id space and
+    /// ONE link, one WebSocket. The BearerManager translates this local id into its global id space and
     /// mints a fresh global on each reconnect (linkDown forgets the old mapping), so the node sees each
     /// reconnection as a new link, which is correct.
     private val linkId: LinkId = 1L
-    /// Stable synthetic peer id (16 bytes) for the manager's bookkeeping — derived from the relay URL so
+    /// Stable synthetic peer id (16 bytes) for the manager's bookkeeping, derived from the relay URL so
     /// it's identical every reconnect. The node ignores it (it identifies the relay via Noise).
     private val peerId: ByteArray =
         MessageDigest.getInstance("SHA-256").digest(relayUrl.toByteArray()).copyOf(16)
@@ -163,7 +163,7 @@ class RelayBearer(private val relayUrl: String) : Bearer {
                     up = true
                     Log.i(TAG, "relay link-up peer=${peerId.toHex().take(8)}")
                     sink?.linkUp(linkId, HopRole.DIALER, peerId)   // dialer = Noise initiator
-                    // F-13: reset backoff only after the link has been stable a while, not on open — a
+                    // F-13: reset backoff only after the link has been stable a while, not on open, a
                     // relay that accepts then immediately drops isn't then re-dialed at the 1s floor forever.
                     stableFuture?.cancel(false)
                     stableFuture = try {
