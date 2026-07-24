@@ -12,6 +12,7 @@ git-cliff. Do not edit by hand.
 - bump create-github-app-token to v3.2.0 across all mirrored components (efc9f6c)
 
 ### Chore
+- purge em-dashes and en-dashes from source (d222435)
 - bump org.robolectric:robolectric in /apps/android/HopDemo (#110) (89cb246)
 - bump androidx.test:core in /bearers/android (#113) (df1e0e0)
 - drop the root license, license per-component (FSL-1.1-ALv2) (#146) (be2a5a7)
@@ -25,6 +26,10 @@ git-cliff. Do not edit by hand.
 
 ### Documentation
 - branded, marketable READMEs for every sub-repo (9c2a477)
+
+### Features
+- finish inbound (import), drop export_pr (41c095e)
+- auto-generate monorepo + per-library changelogs (git-cliff) (8c64c37)
 
 ### Other
 - CLA gate on contributions (preserve commercial relicensing of core) (5a9aa7d)
