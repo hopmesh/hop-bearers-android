@@ -5,6 +5,8 @@ git-cliff. Do not edit by hand.
 ## Unreleased
 
 ### Bug Fixes
+- fmt drift, orphaned doc comments, and Android tests that raced the network (dc44ef4)
+- two bugs in my own one-time-prekey work, plus three CI breaks (93859f8)
 - pin the correct Gradle 9.6.1 distribution SHA-256 (2dbc987)
 - root-cause + close the bearer-lan JaCoCo coverage wobble (F-3) (#103) (5c2045f)
 
@@ -12,6 +14,7 @@ git-cliff. Do not edit by hand.
 - bump create-github-app-token to v3.2.0 across all mirrored components (efc9f6c)
 
 ### Chore
+- bump com.android.library in /bearers/android (65ed034)
 - purge em-dashes and en-dashes from source (d222435)
 - bump org.robolectric:robolectric in /apps/android/HopDemo (#110) (89cb246)
 - bump androidx.test:core in /bearers/android (#113) (df1e0e0)
@@ -25,6 +28,7 @@ git-cliff. Do not edit by hand.
 - Kotlin 2.4/AGP 9.2.1/Compose BOM 2026.06/okhttp 5.4 toolchain migration (#90) (d4844bd)
 
 ### Documentation
+- regenerate from conventional commits (a355901)
 - branded, marketable READMEs for every sub-repo (9c2a477)
 
 ### Features
@@ -32,6 +36,9 @@ git-cliff. Do not edit by hand.
 - auto-generate monorepo + per-library changelogs (git-cliff) (8c64c37)
 
 ### Other
+- cut the frame cap to the protocol's, and pin it (2a16945)
+- delete unwired trait surface and correct 12 stale claims (4e4272f)
+- wire the relay pool end to end, and stop the wire guard false-firing (35946e0)
 - CLA gate on contributions (preserve commercial relicensing of core) (5a9aa7d)
 - SECURITY.md per component + enable-security in the bootstrap script (a1492e9)
 - copyright holder is Hop Mesh, LLC (7d8c514)
