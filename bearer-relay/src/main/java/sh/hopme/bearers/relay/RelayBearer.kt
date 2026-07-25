@@ -45,7 +45,24 @@ import java.util.concurrent.TimeUnit
 // so they're unit-testable). RELAY_BACKOFF_MIN_MS / _MAX_MS / _STABLE_MS / _DEAD_AFTER / _DEAD_MS are
 // defined there; RelayBearer owns only the state machine that calls RelayBackoff.step().
 
-class RelayBearer(private val relayUrl: String) : Bearer {
+/**
+ * `resolveUrl` is called PER DIAL ATTEMPT rather than fixed at construction, which is what makes
+ * relay failover possible without a live re-register on the shared `BearerManager` (which has none).
+ * A fixed URL meant a dead relay was retried forever and the only way to move was an app restart.
+ * Returning null or blank means "nothing dialable right now": a WAIT (retry on the next backoff
+ * tick), never a stop, or a transient outage would end reach permanently.
+ *
+ * `reportOutcome(url, ok)` feeds each attempt back to the host so the node's §19 relay pool can
+ * score endpoints. Both default to fixed-URL behavior, so existing callers are unchanged.
+ *
+ * Mirrors bearers/apple/HopBearerRelay RelayBearer. Keep the two in step; per-platform bearer drift
+ * is a documented live-bug source (see bearers/CLAUDE.md).
+ */
+class RelayBearer(
+    seedUrl: String,
+    private val resolveUrl: () -> String? = { seedUrl },
+    private val reportOutcome: (String, Boolean) -> Unit = { _, _ -> },
+) : Bearer {
     override var sink: LinkSink? = null
     /// Short transport tag for the consumer's UI (Bearer contract). The cloud relay link surfaces as "Relay".
     override val transportName = "Relay"
@@ -54,10 +71,12 @@ class RelayBearer(private val relayUrl: String) : Bearer {
     /// mints a fresh global on each reconnect (linkDown forgets the old mapping), so the node sees each
     /// reconnection as a new link, which is correct.
     private val linkId: LinkId = 1L
-    /// Stable synthetic peer id (16 bytes) for the manager's bookkeeping, derived from the relay URL so
-    /// it's identical every reconnect. The node ignores it (it identifies the relay via Noise).
-    private val peerId: ByteArray =
-        MessageDigest.getInstance("SHA-256").digest(relayUrl.toByteArray()).copyOf(16)
+    /// Stable synthetic peer id (16 bytes) for the manager's bookkeeping. The node ignores it (it
+    /// identifies the relay via Noise). Derived from the SEED url and then held fixed: the manager keys its bookkeeping on this, so
+    /// it must not change when we fail over to a different endpoint.
+    private val peerId: ByteArray = stablePeerIdForUrl(seedUrl)
+    /// The url the CURRENT attempt used, so an outcome is attributed to the endpoint that earned it.
+    private var currentUrl: String? = null
 
     private val client = OkHttpClient.Builder().build()
 
@@ -101,7 +120,7 @@ class RelayBearer(private val relayUrl: String) : Bearer {
         exec.execute {
             if (started) return@execute
             started = true
-            Log.i(TAG, "relay node-start url=$relayUrl peer=${peerId.toHex().take(8)}")
+            Log.i(TAG, "relay node-start peer=${peerId.toHex().take(8)}")
             dial()
         }
     }
@@ -148,19 +167,49 @@ class RelayBearer(private val relayUrl: String) : Bearer {
     /// otherwise private and its thread would leak silently.
     internal val isTornDown: Boolean get() = exec.isShutdown
 
+    /// Test seam: resolve one dial candidate exactly as `dial()` does, WITHOUT touching a socket.
+    /// Keeps the resolution contract deterministically testable on the JVM: a real dial would need
+    /// network timing and sleeps, which bearers/CLAUDE.md warns flakes in these unit tests. The
+    /// socket-level behavior is covered end to end on the Apple side against a loopback server.
+    internal fun resolveCandidateForTest(): String? = resolveUrl()?.takeIf { it.isNotBlank() }
+
+    /// Test seam: the report path `dial()`/`down()` use, so attribution is assertable without a dial.
+    internal fun reportForTest(url: String, ok: Boolean) = reportOutcome(url, ok)
+
+    /// Test seam: the synthetic peer id, so a test can assert it follows the SEED across failover
+    /// (the manager keys its bookkeeping on it, so it must not churn when the endpoint changes).
+    internal val peerIdForTest: ByteArray get() = peerId
+
+    internal companion object {
+        /// The peer-id derivation, exposed so a test can compute the expected value rather than
+        /// re-implementing SHA-256 and drifting from it.
+        internal fun stablePeerIdForUrl(url: String): ByteArray =
+            MessageDigest.getInstance("SHA-256").digest(url.toByteArray()).copyOf(16)
+    }
+
     // ---- dial / down / reconnect (all on `exec`) ----
 
     private fun dial() {
         if (!started) return
-        Log.i(TAG, "relay dial $relayUrl")
+        val candidate = resolveUrl()
+        if (candidate.isNullOrBlank()) {
+            // Every pooled endpoint is backed off. Wait for the next tick; do NOT stop.
+            currentUrl = null
+            scheduleReconnect()
+            return
+        }
+        currentUrl = candidate
+        Log.i(TAG, "relay dial $candidate")
         // Capture the executor this connection belongs to. All of its OkHttp callbacks post here via
         // postTo(), so a callback racing stop() (or from this old connection after a restart onto a
         // fresh exec) lands on the shut executor and is dropped, never a RejectedExecutionException.
         val dialExec = exec
-        ws = client.newWebSocket(Request.Builder().url(relayUrl).build(), object : WebSocketListener() {
+        ws = client.newWebSocket(Request.Builder().url(candidate).build(), object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) = run {
                 postTo(dialExec) {
                     up = true
+                    // Score the endpoint that actually answered, not whatever the pool returns now.
+                    currentUrl?.let { reportOutcome(it, true) }
                     Log.i(TAG, "relay link-up peer=${peerId.toHex().take(8)}")
                     sink?.linkUp(linkId, HopRole.DIALER, peerId)   // dialer = Noise initiator
                     // F-13: reset backoff only after the link has been stable a while, not on open, a
@@ -205,6 +254,10 @@ class RelayBearer(private val relayUrl: String) : Bearer {
     private fun down() {
         stableFuture?.cancel(false); stableFuture = null
         ws = null
+        // Report BEFORE scheduling the next attempt, so the pool has already scored this endpoint
+        // down by the time dial() asks it where to go. Reporting after would re-pick the corpse.
+        currentUrl?.let { reportOutcome(it, false) }
+        currentUrl = null
         if (up) { up = false; sink?.linkDown(linkId) }
         scheduleReconnect()
     }

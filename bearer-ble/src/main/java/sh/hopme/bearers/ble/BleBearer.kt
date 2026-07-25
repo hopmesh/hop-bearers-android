@@ -85,7 +85,10 @@ internal const val HEAL_INTERVAL_S = 30L        // F-12: peripheral self-heal ca
 internal const val ADV_PROBE_MS = 180_000L      // ~3 min: force-recycle the connectable advertiser
 internal const val ADV_PROBE_GAP_MS = 1_500L    // brief stop→start gap so the controller drops the old set cleanly
 
-internal const val MAX_FRAME_BYTES = 4 * 1024 * 1024   // reject a length prefix over this (matches Apple MAX_FRAME / LAN_MAX_FRAME)
+// Reject a length prefix over the PROTOCOL's own cap (hop-core MAX_BUNDLE_WIRE_BYTES). Was 4 MiB
+// with a comment claiming it matched LAN_MAX_FRAME; LAN is 1 MiB, so the claim was false and BLE
+// accepted 4x what the core will ever decode. Pinned by tools/ble-backoff-parity.sh.
+internal const val MAX_FRAME_BYTES = 1 shl 20
 internal const val PING_MS = 1000L
 internal const val DEAD_MS = 5000L
 internal const val DEAD_BG_MS = 15_000L
