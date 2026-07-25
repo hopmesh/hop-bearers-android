@@ -215,7 +215,10 @@ class LinkProtocolTest {
 
     // ---- sendData / close idempotency + write-failure -------------------------------------------
 
-    @Test fun sendDataWritesADataFrameAndIsNoOpAfterClose() {
+    @Test fun sendDataQueuesThenWritesADataFrameAndIsNoOpAfterClose() {
+        // R-02: sendData now ENQUEUES (it is the only sender reached from the driver's serial
+        // `hop.core` thread, which must never block on a peer's radio). The socket write happens
+        // when the link's `l2cap-tx` thread drains, driven here synchronously.
         val out = ByteArrayOutputStream()
         val s = Sink()
         val p = LinkProtocol(
@@ -223,13 +226,41 @@ class LinkProtocolTest {
             onUp = { s.up = true }, onData = { s.data.add(it) }, onClosed = { s.closes.add(it) },
         )
         p.sendData("x".toByteArray())
+        assertEquals("nothing hits the socket on the caller's thread", 0, out.size())
+        assertTrue("the frame is queued", p.queuedBytes > 0)
+        p.writePendingOnce(timeoutMs = 0)
         assertTrue(frameTypes(out.toByteArray()).contains(FRAME_DATA))
+        assertEquals("the queue drained", 0L, p.queuedBytes)
         val len = out.size()
         p.close("done")
         p.close("again") // idempotent: no second onClosed
         p.sendData("y".toByteArray()) // no-op after close
+        p.writePendingOnce(timeoutMs = 0)
         assertEquals("send after close writes nothing", len, out.size())
         assertEquals("close is idempotent", 1, s.closes.size)
+    }
+
+    @Test fun aPeerThatStopsDrainingIsClosedRatherThanQueuedWithoutBound() {
+        // The other half of R-02. Moving the write off the core thread must not turn head-of-line
+        // blocking into unbounded memory growth, and silently dropping frames would leave a link
+        // that looks alive but is a black hole. Over the cap the link CLOSES, so the epidemic router
+        // re-offers over another path.
+        val out = ByteArrayOutputStream()
+        val s = Sink()
+        val p = LinkProtocol(
+            out, ByteArrayInputStream(ByteArray(0)), 1, true, id16(0xF0),
+            onUp = { s.up = true }, onData = { s.data.add(it) }, onClosed = { s.closes.add(it) },
+        )
+        val chunk = ByteArray(64 * 1024)
+        var sent = 0
+        while (!p.isClosed && sent < 200) { p.sendData(chunk); sent++ }   // never drained
+        assertTrue("a peer that never drains must be closed", p.isClosed)
+        assertTrue("closed for backpressure", s.closes.any { it.contains("backpressure") })
+        assertTrue(
+            "the queue stayed bounded (<= cap + one frame), was ${p.queuedBytes}",
+            p.queuedBytes <= MAX_TX_QUEUE_BYTES + chunk.size + 5,
+        )
+        assertEquals("nothing was written, since nothing drained", 0, out.size())
     }
 
     @Test fun writeFailureClosesTheLink() {

@@ -7,6 +7,9 @@ import android.util.Log
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 
 // LinkProtocol - the BLE link's framing + HELLO/PING/PONG/DATA dispatch + keepalive/liveness logic,
 // lifted out of `Link` (BleBearer.kt) so it can be exercised over ordinary InputStream/OutputStream on
@@ -54,6 +57,26 @@ internal class LinkProtocol(
     val isClosed: Boolean get() = closed
     private val writeLock = Any()
 
+    // ---- outbound queue (R-02) ------------------------------------------------------------------
+    //
+    // Writes used to go straight to the L2CAP socket on the CALLER's thread. The caller is the
+    // driver's `pump()`, which runs on the single serial `hop.core` HandlerThread that owns ALL node
+    // state. So one BLE peer whose receive window was full blocked that thread inside `out.write`,
+    // and with it every other link (BLE, LAN, relay), all inbound processing, and `tick()` itself:
+    // retransmits, prekey rotation and OPK reaping all stall behind an unrelated stranger's radio.
+    // That couples node liveness to the least reliable component in the system.
+    //
+    // Frames are now enqueued and drained by the link's own writer thread, so `sendData` never
+    // blocks the core. The queue is BOUNDED: a peer that cannot drain is not a usable link, and an
+    // unbounded queue would just convert head-of-line blocking into unbounded memory growth.
+    private val txQueue = LinkedBlockingQueue<ByteArray>()
+
+    /// Incremented by the CALLER (`hop.core` via sendData) and decremented by the writer thread, so
+    /// it is genuinely concurrent and a `@Volatile Long` would lose updates under a read-modify-write
+    /// race. The consequence would be a slow drift in the backpressure threshold, which is exactly
+    /// the kind of bug that only shows up under the load this cap exists to survive.
+    private val txQueuedBytes = AtomicLong(0)
+
     // §6: a link is "stable" once it has stayed UP for >= 30 s.
     fun stableUp(): Boolean =
         up && becameUpMs != 0L && clock() - becameUpMs >= 30_000L
@@ -86,29 +109,69 @@ internal class LinkProtocol(
     }
 
     /// Bearer.send entry point: wrap the consumer's application bytes in a DATA frame (0x10) and send.
+    /// Bearer.send path: ENQUEUE, never write. This is the ONLY sender reached from the driver's
+    /// `pump()` on the serial `hop.core` thread, so it is the only one that must not block (see the
+    /// txQueue note above). Control frames (HELLO/PING/PONG) are emitted from the link's OWN threads,
+    /// where a blocking write harms nothing, so they stay synchronous: queueing them would change
+    /// close-time semantics and buy nothing. Frames are self-delimiting, so DATA interleaving with a
+    /// control frame under `writeLock` is safe and order between the two classes does not matter.
+    ///
+    /// Over the queue cap the link is CLOSED rather than silently dropping frames: a dropped DATA
+    /// frame turns the link into a black hole that still looks alive, whereas closing lets the
+    /// epidemic router re-offer the bundle over another path.
     fun sendData(bytes: ByteArray) {
         if (closed) return
-        sendFrame(byteArrayOf(FRAME_DATA.toByte()) + bytes)
+        val body = byteArrayOf(FRAME_DATA.toByte()) + bytes
+        val n = body.size
+        if (txQueuedBytes.get() + 4 + n > MAX_TX_QUEUE_BYTES) {
+            close("tx backpressure: ${txQueuedBytes.get()}B queued, peer not draining")
+            return
+        }
+        txQueuedBytes.addAndGet((4 + n).toLong())
+        txQueue.put(header(n) + body)
     }
+
+    private fun header(n: Int) = byteArrayOf(
+        (n ushr 24).toByte(),
+        (n ushr 16).toByte(),
+        (n ushr 8).toByte(),
+        n.toByte(),
+    )
 
     private fun sendFrame(body: ByteArray) {
         if (closed) return
         val n = body.size
-        val hdr = byteArrayOf(
-            (n ushr 24).toByte(),
-            (n ushr 16).toByte(),
-            (n ushr 8).toByte(),
-            n.toByte(),
-        )
         try {
             synchronized(writeLock) {
-                out.write(hdr); out.write(body); out.flush()
+                out.write(header(n)); out.write(body); out.flush()
             }
             txBytes += (4 + n).toLong()
         } catch (e: IOException) {
             close("write: ${e.message}")
         }
     }
+
+    /// Blocking drain of ONE queued frame, run by the link's writer thread (`l2cap-tx`). Returns
+    /// false when the link is closed, so the shell's loop can exit. A null poll is a normal idle
+    /// tick, not an error.
+    fun writePendingOnce(timeoutMs: Long = 250): Boolean {
+        if (closed) return false
+        val frame = txQueue.poll(timeoutMs, TimeUnit.MILLISECONDS) ?: return !closed
+        try {
+            synchronized(writeLock) {
+                out.write(frame); out.flush()
+            }
+            txBytes += frame.size.toLong()
+            txQueuedBytes.addAndGet(-frame.size.toLong())
+        } catch (e: IOException) {
+            close("write: ${e.message}")
+            return false
+        }
+        return !closed
+    }
+
+    /// Test seam: bytes currently queued but not yet on the wire.
+    internal val queuedBytes: Long get() = txQueuedBytes.get()
 
     /// Blocking read loop (Link runs this on its l2cap-rx thread): decode framed messages until closed
     /// or eof/IO error.

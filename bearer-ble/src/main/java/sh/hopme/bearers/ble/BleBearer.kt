@@ -89,6 +89,13 @@ internal const val ADV_PROBE_GAP_MS = 1_500L    // brief stop→start gap so the
 // with a comment claiming it matched LAN_MAX_FRAME; LAN is 1 MiB, so the claim was false and BLE
 // accepted 4x what the core will ever decode. Pinned by tools/ble-backoff-parity.sh.
 internal const val MAX_FRAME_BYTES = 1 shl 20
+
+// R-02: cap on bytes queued for one link but not yet on the wire. Four max-size frames: enough to
+// absorb a burst (a carrier-chunked message, a flood of adverts on link-up) without stalling, small
+// enough that a peer which has stopped draining is detected in seconds rather than after the heap
+// grows. Exceeding it closes the link, because a peer that cannot drain 4 MiB is not a usable link
+// and the epidemic router will re-offer over another path.
+internal const val MAX_TX_QUEUE_BYTES = 4L * (1 shl 20)
 internal const val PING_MS = 1000L
 internal const val DEAD_MS = 5000L
 internal const val DEAD_BG_MS = 15_000L
@@ -149,6 +156,11 @@ internal class Link(
     fun start() {
         proto.sendHello()
         thread(name = "l2cap-rx") { proto.runReadLoop() }
+        // R-02: the socket write moved OFF the caller. `Bearer.send` is invoked from the driver's
+        // pump() on the single serial `hop.core` thread that owns all node state, so a blocking
+        // L2CAP write there stalled every other link, all inbound processing, and tick(). This
+        // thread owns the blocking write instead; sendData only enqueues.
+        thread(name = "l2cap-tx") { while (proto.writePendingOnce()) { /* drain until closed */ } }
         sched.scheduleAtFixedRate({ proto.tick() }, PING_MS, PING_MS, TimeUnit.MILLISECONDS)
     }
 
