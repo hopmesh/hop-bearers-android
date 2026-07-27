@@ -28,6 +28,7 @@ git-cliff. Do not edit by hand.
 - Kotlin 2.4/AGP 9.2.1/Compose BOM 2026.06/okhttp 5.4 toolchain migration (#90) (d4844bd)
 
 ### Documentation
+- regenerate from conventional commits (102ae67)
 - regenerate from conventional commits (1572ae2)
 - regenerate from conventional commits (a355901)
 - branded, marketable READMEs for every sub-repo (9c2a477)
@@ -37,6 +38,7 @@ git-cliff. Do not edit by hand.
 - auto-generate monorepo + per-library changelogs (git-cliff) (8c64c37)
 
 ### Other
+- a stopped Android central revived itself from an in-flight scan callback (ea43289)
 - move the BLE socket write off the node's core thread (R-02) (41fd3fb)
 - cut the frame cap to the protocol's, and pin it (2a16945)
 - delete unwired trait surface and correct 12 stale claims (4e4272f)
