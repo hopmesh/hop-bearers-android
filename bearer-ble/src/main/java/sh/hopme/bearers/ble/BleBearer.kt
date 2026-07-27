@@ -413,9 +413,22 @@ internal class Central(
     private var scanning = false
     private var currentMode = -1
 
-    fun start() = applyScan(ScanSettings.SCAN_MODE_LOW_LATENCY)
+    /// Set by [stop], cleared by [start]. BLE scan results arrive on a HANDLER, so a callback can
+    /// already be queued when stop() runs: it would then find a freshly-cleared dial slot and connect,
+    /// bringing a link back up on a bearer that is supposed to be down. Observed on a Pixel 7 the
+    /// moment per-transport disable landed: teardown closed 3 links, then a DIALING 10ms later
+    /// re-established one. `scanning` cannot serve as this guard because it tracks whether the SCANNER
+    /// is armed, not whether the bearer is meant to be running.
+    @Volatile
+    private var stopped = false
+
+    fun start() {
+        stopped = false
+        applyScan(ScanSettings.SCAN_MODE_LOW_LATENCY)
+    }
 
     fun stop() {
+        stopped = true
         try { if (scanning) adapter.bluetoothLeScanner?.stopScan(scanCb) } catch (_: Exception) {}
         scanning = false
         currentMode = -1
@@ -437,6 +450,9 @@ internal class Central(
     }
 
     private fun applyScan(mode: Int) { // R9: never the 5th startScan in any 30 s window
+        // The throttle guard below and requestScanMode both re-enter through main.postDelayed, so a
+        // deferred call can land after stop() and re-arm the scanner on a bearer meant to be down.
+        if (stopped) return
         val now = System.currentTimeMillis()
         while (scanStarts.isNotEmpty() && now - scanStarts.first() > 30_000) scanStarts.removeFirst()
         if (scanStarts.size >= 4) {
@@ -479,6 +495,7 @@ internal class Central(
     }
 
     private fun tryDial(dev: BluetoothDevice, pre: ByteArray?) {
+        if (stopped) return   // an in-flight scan callback must not revive a stopped bearer
         val addr = dev.address
         // Address-based suppression: peers whose advert has NO mfg prefix (pre=null - the macOS/iOS
         // peripherals) skip the prefix gate and were re-dialed on EVERY advert just to cancel after the
