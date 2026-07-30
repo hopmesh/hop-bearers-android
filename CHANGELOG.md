@@ -5,6 +5,8 @@ git-cliff. Do not edit by hand.
 ## Unreleased
 
 ### Bug Fixes
+- make the PLAT-001 tests actually run, and correct what the last commit claimed (15065c8)
+- disabling a transport now actually stops it (PLAT-001) (7b84c71)
 - fmt drift, orphaned doc comments, and Android tests that raced the network (dc44ef4)
 - two bugs in my own one-time-prekey work, plus three CI breaks (93859f8)
 - pin the correct Gradle 9.6.1 distribution SHA-256 (2dbc987)
@@ -14,6 +16,7 @@ git-cliff. Do not edit by hand.
 - bump create-github-app-token to v3.2.0 across all mirrored components (efc9f6c)
 
 ### Chore
+- drop two build artifacts a git add -A swept into the previous commit (4f1f1d3)
 - bump com.android.library in /bearers/android (65ed034)
 - purge em-dashes and en-dashes from source (d222435)
 - bump org.robolectric:robolectric in /apps/android/HopDemo (#110) (89cb246)
@@ -28,6 +31,7 @@ git-cliff. Do not edit by hand.
 - Kotlin 2.4/AGP 9.2.1/Compose BOM 2026.06/okhttp 5.4 toolchain migration (#90) (d4844bd)
 
 ### Documentation
+- regenerate from conventional commits (b96e019)
 - regenerate from conventional commits (330c8c6)
 - regenerate from conventional commits (096180b)
 - regenerate from conventional commits (102ae67)
@@ -64,5 +68,6 @@ git-cliff. Do not edit by hand.
 - enforce purpose/platform/package (collapse sdk/wrappers, apps/web -> apps/web/site) (#116) (afd52df)
 
 ### Testing
+- replace a tautological custody assertion and correct two more overclaiming comments (890cba1)
 - LAN 95% / Relay 100% / BLE 99% + fix non-restartable LanBearer (#68) (0fab82d)
 
