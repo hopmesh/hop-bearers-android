@@ -124,13 +124,13 @@ internal const val FRAME_DATA = 0x10
 // on-device workflow, not JVM/Robolectric (see build.gradle.kts jacoco exclusions).
 internal class Link(
     private val socket: BluetoothSocket,
-    val linkId: Long,                                   // monotonic id minted by the bearer; the sink's key
-    val isDialer: Boolean,
+    override val linkId: Long,                          // monotonic id minted by the bearer; the sink's key
+    override val isDialer: Boolean,
     myId: ByteArray,
     onUp: (Link) -> Unit,
     onData: (Link, ByteArray) -> Unit,
     onClose: (Link) -> Unit,
-) {
+) : BleLink {
     private val sched = Executors.newSingleThreadScheduledExecutor()
     private val proto = LinkProtocol(
         out = socket.outputStream,
@@ -147,7 +147,7 @@ internal class Link(
         },
     )
 
-    val peerId: ByteArray? get() = proto.peerId
+    override val peerId: ByteArray? get() = proto.peerId
     val up: Boolean get() = proto.up
 
     // §6: a link is "stable" once it has stayed UP for >= 30 s.
@@ -165,9 +165,9 @@ internal class Link(
     }
 
     /// Bearer.send entry point: wrap the consumer's application bytes in a DATA frame (0x10) and send.
-    fun sendData(bytes: ByteArray) = proto.sendData(bytes)
+    override fun sendData(bytes: ByteArray) = proto.sendData(bytes)
 
-    fun close(why: String) = proto.close(why)
+    override fun close(why: String) = proto.close(why)
 }
 
 // ---- ACCEPTOR (peripheral): session-stable L2CAP listener + one GATT read char + advertiser.
@@ -177,6 +177,7 @@ internal class Peripheral(
     private val ctx: Context,
     private val myId: ByteArray,
     private val mintLinkId: () -> Long,
+    private val onAdopt: (Link) -> Boolean,
     private val onLink: (Link) -> Unit,
     private val onData: (Link, ByteArray) -> Unit,
     private val onClose: (Link) -> Unit,
@@ -238,7 +239,16 @@ internal class Peripheral(
                     break
                 }
                 Log.i(TAG, "ACCEPTED inbound L2CAP - wrapping link (reaper armed)")
-                Link(sock, mintLinkId(), isDialer = false, myId, onLink, onData, onClose).start()
+                val link = Link(sock, mintLinkId(), isDialer = false, myId, onLink, onData, onClose)
+                // PLAT-001: hand the link to the bearer BEFORE starting it, so a stop() that lands now
+                // can close it. `accept()` returns a socket we are already holding, so the `!stopped`
+                // loop condition above cannot cover this window: the bearer decides.
+                if (!onAdopt(link)) {
+                    Log.i(TAG, "ACCEPTED but bearer is stopped - dropping inbound L2CAP")
+                    link.close("bearer-stopped")
+                    continue
+                }
+                link.start()
             }
             if (!stopped && server === s) { server = null } // let self-heal re-open a dead listener
         }
@@ -387,6 +397,11 @@ internal class Central(
     private val ctx: Context,
     private val myId: ByteArray,
     private val mintLinkId: () -> Long,
+    private val onAdopt: (Link) -> Boolean,
+    /// PLAT-001: has the BEARER been stopped? Distinct from this plane's own `stopped`, which is only set
+    /// once teardown reaches it. Used to tell "the peer failed us" from "we tore this down ourselves", so
+    /// a local stop never charges dial backoff against an innocent peer.
+    private val bearerStopped: () -> Boolean,
     private val onLink: (Link) -> Unit,
     private val onData: (Link, ByteArray) -> Unit,
     private val onClose: (Link) -> Unit,
@@ -649,6 +664,20 @@ internal class Central(
                     onData,
                     onClose = { l -> dialerLinkClosed(g, addr, l); onClose(l) },
                 )
+                // PLAT-001: this thread blocks in connect(), so the `stopped` check in tryDial is long
+                // past by the time the socket is up. Adopt through the bearer, which refuses (and we
+                // then close) if the transport was switched off while we were connecting. This is the
+                // widest window of the three: it is the one the Pixel 7 regression noted at :416 hit.
+                if (!onAdopt(link)) {
+                    Log.i(TAG, "L2CAP dialed but bearer is stopped addr=$addr - dropping")
+                    // close() runs the onClose chain SYNCHRONOUSLY, so dialerLinkClosed has already
+                    // freed the dial slot and (unless CLOSE_GATT_AFTER_L2CAP) closed + forgotten the
+                    // GATT. Repeating either here double-closed the same BluetoothGatt. Mirror the
+                    // success path below instead: only the flagged case still owes a close.
+                    link.close("bearer-stopped")
+                    if (CLOSE_GATT_AFTER_L2CAP) { g.close(); forgetGatt(addr, g) }
+                    return@thread
+                }
                 if (CLOSE_GATT_AFTER_L2CAP) { g.close(); forgetGatt(addr, g) } // R5 (flagged, default off)
                 link.start()
             } catch (e: IOException) {
@@ -674,9 +703,15 @@ internal class Central(
         // android-06: a link that never reached UP (accepted L2CAP but no HELLO - a wedged/half-dead peer
         // stack) must accrue backoff, or it is re-dialed on every advert forever with failCount at zero,
         // monopolizing a dial slot. Only a link that was actually UP resets backoff.
+        //
+        // PLAT-001: unless WE tore it down. A link closed because this bearer stopped (the user switched
+        // the transport off, or the adapter went STATE_OFF) never reached UP, so the `else` branch used
+        // to charge a dial failure to a peer that did nothing wrong: the next enable started with that
+        // peer already in backoff, and repeated toggling could push it to the ~2 min quarantine cap.
+        // Backoff models PEER reachability, so a local teardown must not feed it.
         if (l.up) {
             if (l.stableUp()) synchronized(dial) { dialState.clearBackoffForAddr(addr) } // §6 reset after long-lived link
-        } else {
+        } else if (!stopped && !bearerStopped()) {
             fail(addr) // connect-then-no-HELLO: count it as a failed dial
         }
     }
@@ -706,9 +741,22 @@ class BleBearer(private val ctx: Context, private val myId: ByteArray) : Bearer 
     override val transportName = "BT"
 
     private val lock = Any()
-    private val linksByPeerId = HashMap<String, Link>()   // dedup: one survivor per peer (SPEC §2.3)
-    private val linksByLinkId = HashMap<Long, Link>()      // send routing + linkUp/linkDown pairing
+    private val linksByPeerId = HashMap<String, BleLink>()   // dedup: one survivor per peer (SPEC §2.3)
+    private val linksByLinkId = HashMap<Long, BleLink>()     // send routing + linkUp/linkDown pairing
+    // PLAT-001: EVERY constructed link, from the moment its socket is up until it closes, including the
+    // ones that have not completed HELLO. The two maps above are populated in onUp, so before this
+    // existed a link that was mid-handshake when stop() ran was in neither of them: closeAll() could
+    // not reach it, its rx/tx threads and 1 Hz keepalive kept running, and it then surfaced a link on a
+    // transport the user had switched off. The LAN bearer has kept this map (`allLinksByLinkId`,
+    // "includes pre-HELLO and active links") since it was written; the BLE pair had nothing.
+    private val allLinks = HashMap<Long, BleLink>()
     private var nextLinkId = 1L                            // monotonic LinkId, minted per established Link
+    // PLAT-001: set by stop(), cleared by start(). Central already carried a `stopped` flag for the
+    // scan-callback race (see its comment about the Pixel 7 regression), but it only gated tryDial, so
+    // an already-accepted socket or an in-flight blocking dial walked straight past it. This one is the
+    // BEARER's, and it gates the point where a link is handed over, whichever path produced it.
+    @Volatile
+    private var stopped = false
 
     private var central: Central? = null
     private var peripheral: Peripheral? = null
@@ -720,6 +768,7 @@ class BleBearer(private val ctx: Context, private val myId: ByteArray) : Bearer 
     private val noScan = sysProp("debug.blelab.noscan") == "1"
 
     override fun start() {
+        markStarted()
         Log.i(TAG, "NODE START myId=${myId.toHex()} - ${if (noScan) "PERIPHERAL-ONLY (noscan)" else "symmetric dual role (peripheral + central)"}")
         // F-10: recover from a Bluetooth adapter toggle (airplane mode, battery saver, the user, or a
         // stack reset). The shared BleBearer previously had ZERO adapter-state handling, so a toggle
@@ -760,6 +809,7 @@ class BleBearer(private val ctx: Context, private val myId: ByteArray) : Bearer 
             peripheral = Peripheral(
                 ctx, myId,
                 mintLinkId = { mint() },
+                onAdopt = { adopt(it) },
                 onLink = { onUp(it) },
                 onData = { l, b -> onData(l, b) },
                 onClose = { onClose(it) },
@@ -767,6 +817,8 @@ class BleBearer(private val ctx: Context, private val myId: ByteArray) : Bearer 
             central = Central(
                 ctx, myId,
                 mintLinkId = { mint() },
+                onAdopt = { adopt(it) },
+                bearerStopped = { isStopped() },
                 onLink = { onUp(it) },
                 onData = { l, b -> onData(l, b) },
                 onClose = { onClose(it) },
@@ -798,6 +850,9 @@ class BleBearer(private val ctx: Context, private val myId: ByteArray) : Bearer 
     }
 
     override fun stop() { // SPEC R11: STATE_OFF / teardown
+        // Set FIRST: from here on no link may be adopted or surfaced, whichever radio thread produced
+        // it. That is what BearerManager.setEnabled(tag, false) promises the caller.
+        stopped = true
         btReceiver?.let { try { ctx.unregisterReceiver(it) } catch (_: Exception) {} }
         btReceiver = null
         statusExec?.shutdownNow(); statusExec = null
@@ -811,17 +866,41 @@ class BleBearer(private val ctx: Context, private val myId: ByteArray) : Bearer 
 
     private fun mint(): Long = synchronized(lock) { val id = nextLinkId; nextLinkId += 1; id }
 
-    private fun onUp(link: Link) { // HELLO completed: surface to sink, then dedup (§2.3)
+    /// PLAT-001: called by the radio planes the instant a link's socket is up, BEFORE HELLO. Returns
+    /// false if the bearer is stopped, in which case the caller closes the link instead of starting it.
+    /// Registering here is what lets [closeAll] reach a link that never completes its handshake.
+    internal fun adopt(link: BleLink): Boolean {
+        synchronized(lock) {
+            if (stopped) return false
+            allLinks[link.linkId] = link
+        }
+        return true
+    }
+
+    internal fun isStopped(): Boolean = stopped
+
+    /// start(): the bearer is meant to be running again, so [adopt] accepts links once more.
+    internal fun markStarted() { stopped = false }
+
+    internal fun onUp(link: BleLink) { // HELLO completed: surface to sink, then dedup (§2.3)
         val peer = link.peerId ?: return
+        // PLAT-001: HELLO can complete after the bearer was stopped (the user switched the transport
+        // off while this channel was mid-handshake). Surfacing it would hand the consumer a link on a
+        // transport that is supposed to be down, so close it instead. It was never in linksByLinkId,
+        // so this close emits no linkDown.
+        if (stopped) { link.close("bearer-stopped"); return }
         val key = peer.toHex()
-        synchronized(lock) { linksByLinkId[link.linkId] = link } // register for send routing + down pairing
+        synchronized(lock) {
+            linksByLinkId[link.linkId] = link // register for send routing + down pairing
+            allLinks[link.linkId] = link      // PLAT-001: idempotent; adopt() normally got here first
+        }
         // Surface this leg BEFORE dedup: both legs of a duplicate pair get a linkUp, then dedup closes the
         // loser → the consumer sees that loser's linkDown. NOTE this DIFFERS from the Apple BLE bearer,
         // which under apple-12 dedups BEFORE surfacing (its loser never reaches sink.linkUp). Left as-is
         // here so the consumer-visible link events don't change; unifying on the Apple ordering (to avoid
         // the doomed-handshake churn apple-12 fixed) is a deliberate follow-up, not a silent change here.
         sink?.linkUp(link.linkId, if (link.isDialer) HopRole.DIALER else HopRole.ACCEPTOR, peer)
-        var drop: Link? = null
+        var drop: BleLink? = null
         synchronized(lock) {
             val existing = linksByPeerId[key]
             if (existing == null || existing === link) {
@@ -835,24 +914,26 @@ class BleBearer(private val ctx: Context, private val myId: ByteArray) : Bearer 
                     BleDedupKeep.EXISTING -> existing
                     BleDedupKeep.INCOMING -> link
                 }
-                drop = if (keep === link) existing else link
+                val loser = if (keep === link) existing else link
+                drop = loser
                 linksByPeerId[key] = keep // R3: set survivor BEFORE closing the dropped channel
-                Log.i(TAG, "LINKFLOW DEDUP keep=${keep.linkId} drop=${drop?.linkId} isDialer=${keep.isDialer} peer=${key.take(8)}")
+                Log.i(TAG, "LINKFLOW DEDUP keep=${keep.linkId} drop=${loser.linkId} isDialer=${keep.isDialer} peer=${key.take(8)}")
             }
         }
         drop?.close("dedup") // outside lock: close → onClose → sink.linkDown for the loser
         updateScan()
     }
 
-    private fun onData(link: Link, bytes: ByteArray) {
+    internal fun onData(link: BleLink, bytes: ByteArray) {
         sink?.linkBytes(link.linkId, bytes) // one DATA frame → consumer
     }
 
-    private fun onClose(link: Link) { // R3: identity-checked removal
+    internal fun onClose(link: BleLink) { // R3: identity-checked removal
         val peer = link.peerId
         var removedPeer = false
         val wasUp: Boolean
         synchronized(lock) {
+            if (allLinks[link.linkId] === link) allLinks.remove(link.linkId)   // PLAT-001
             wasUp = linksByLinkId.remove(link.linkId) != null // true iff linkUp had fired
             if (peer != null) {
                 val key = peer.toHex()
@@ -864,9 +945,15 @@ class BleBearer(private val ctx: Context, private val myId: ByteArray) : Bearer 
     }
 
     fun closeAll() { // SPEC R11: drop all local links on power-off / stop
-        val all = synchronized(lock) { linksByPeerId.values.toList() }
+        // PLAT-001: iterate `allLinks`, not `linksByPeerId`. The peer map holds only links that
+        // completed HELLO, so closing it alone left every mid-handshake socket running with its own
+        // rx/tx threads and keepalive: exactly the link that then came up on a "disabled" transport.
+        val all = synchronized(lock) { allLinks.values.toList() }
         all.forEach { it.close("power-off") }
     }
+
+    /// PLAT-001 test seam: how many links the bearer is tracking, INCLUDING pre-HELLO ones.
+    internal fun trackedLinkCount(): Int = synchronized(lock) { allLinks.size }
 
     private fun updateScan() {
         if (noScan) return
