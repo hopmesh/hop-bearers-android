@@ -13,6 +13,8 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
+import java.net.InetSocketAddress
+import java.net.Proxy
 import java.security.MessageDigest
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
@@ -44,6 +46,60 @@ import java.util.concurrent.TimeUnit
 // The backoff constants + the pure reconnect-schedule arithmetic live in RelayBackoff.kt (Android-free
 // so they're unit-testable). RELAY_BACKOFF_MIN_MS / _MAX_MS / _STABLE_MS / _DEAD_AFTER / _DEAD_MS are
 // defined there; RelayBearer owns only the state machine that calls RelayBackoff.step().
+//
+// TOR: there is no Tor code here and there should not be. A host that wants relay traffic to ride Tor
+// runs a proxy (Orbot, or Arti embedded in the app) and passes its `host:port` in as `socksProxy`; the
+// dial string then just happens to be a `.onion` URL, which the node's pool and this bearer treat like
+// any other. See docs/tor.md for what that does and, importantly, does not hide.
+
+/**
+ * What the host's proxy setting resolved to, decided ONCE at construction.
+ *
+ * The third case is the point. A setting that was supplied but does not parse must never quietly
+ * become "dial direct": that is a typo turning into a clearnet connection the user believes is
+ * proxied. Three explicit states leave the dial path no "no proxy configured" branch it can fall
+ * into by accident. Mirrors `SocksProxySetting` in bearers/apple/HopBearerRelay; keep the two in
+ * step (per-platform bearer drift is a documented live-bug source, see bearers/CLAUDE.md).
+ */
+sealed interface SocksProxySetting {
+    /** No proxy configured. Dial normally (the default for every existing caller). */
+    object Direct : SocksProxySetting
+    /** Dial every relay connection through this proxy. */
+    data class Via(val proxy: Proxy) : SocksProxySetting
+    /** A proxy WAS configured but the spec is unusable. Never dial. */
+    object Unusable : SocksProxySetting
+
+    companion object {
+        /**
+         * Resolve a host-supplied `host:port` spec, e.g. `127.0.0.1:9050` for a local Tor listener,
+         * or `[::1]:9050`. Null/blank means no proxy was asked for; anything else must parse or the
+         * bearer refuses to dial at all.
+         */
+        fun of(spec: String?): SocksProxySetting {
+            val raw = spec?.trim().orEmpty()
+            if (raw.isEmpty()) return Direct
+            val host: String
+            val portText: String
+            if (raw.startsWith("[")) {
+                // Bracketed IPv6: the colons inside the address are not the separator.
+                val close = raw.indexOf(']')
+                if (close < 0 || close + 1 >= raw.length || raw[close + 1] != ':') return Unusable
+                host = raw.substring(1, close)
+                portText = raw.substring(close + 2)
+            } else {
+                if (raw.count { it == ':' } != 1) return Unusable
+                host = raw.substringBefore(':')
+                portText = raw.substringAfter(':')
+            }
+            val port = portText.toIntOrNull() ?: return Unusable
+            if (host.isEmpty() || port !in 1..65535) return Unusable
+            // The PROXY's own address is resolved here (it is ours, typically loopback). The TARGET
+            // host is not: OkHttp hands an unresolved address to a SOCKS proxy, which is what lets a
+            // .onion name, that no resolver can answer, be resolved by Tor itself.
+            return Via(Proxy(Proxy.Type.SOCKS, InetSocketAddress(host, port)))
+        }
+    }
+}
 
 /**
  * `resolveUrl` is called PER DIAL ATTEMPT rather than fixed at construction, which is what makes
@@ -55,6 +111,9 @@ import java.util.concurrent.TimeUnit
  * `reportOutcome(url, ok)` feeds each attempt back to the host so the node's §19 relay pool can
  * score endpoints. Both default to fixed-URL behavior, so existing callers are unchanged.
  *
+ * `socksProxy` is a `host:port` spec (e.g. a local Tor listener at `127.0.0.1:9050`); null or blank
+ * dials direct, and an unparseable value refuses to dial rather than falling back to it.
+ *
  * Mirrors bearers/apple/HopBearerRelay RelayBearer. Keep the two in step; per-platform bearer drift
  * is a documented live-bug source (see bearers/CLAUDE.md).
  */
@@ -62,6 +121,7 @@ class RelayBearer(
     seedUrl: String,
     private val resolveUrl: () -> String? = { seedUrl },
     private val reportOutcome: (String, Boolean) -> Unit = { _, _ -> },
+    socksProxy: String? = null,
 ) : Bearer {
     override var sink: LinkSink? = null
     /// Short transport tag for the consumer's UI (Bearer contract). The cloud relay link surfaces as "Relay".
@@ -78,7 +138,12 @@ class RelayBearer(
     /// The url the CURRENT attempt used, so an outcome is attributed to the endpoint that earned it.
     private var currentUrl: String? = null
 
-    private val client = OkHttpClient.Builder().build()
+    /// How the host's proxy setting resolved. Decided once here so no dial can re-interpret it.
+    private val socks: SocksProxySetting = SocksProxySetting.of(socksProxy)
+
+    private val client = OkHttpClient.Builder()
+        .apply { (socks as? SocksProxySetting.Via)?.let { proxy(it.proxy) } }
+        .build()
 
     private fun newExec(): ScheduledExecutorService =
         Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "hop.relay.bearer") }
@@ -180,6 +245,12 @@ class RelayBearer(
     /// (the manager keys its bookkeeping on it, so it must not churn when the endpoint changes).
     internal val peerIdForTest: ByteArray get() = peerId
 
+    /// Test seam: the resolved proxy setting and the HTTP client it produced, so a test can assert
+    /// the client really carries the SOCKS proxy (and that a direct bearer carries none) without
+    /// having to open a socket to find out.
+    internal val socksForTest: SocksProxySetting get() = socks
+    internal val clientProxyForTest: Proxy? get() = client.proxy
+
     internal companion object {
         /// The peer-id derivation, exposed so a test can compute the expected value rather than
         /// re-implementing SHA-256 and drifting from it.
@@ -199,6 +270,17 @@ class RelayBearer(
             return
         }
         currentUrl = candidate
+        if (socks is SocksProxySetting.Unusable) {
+            // The host asked for every relay byte to go through a proxy and the spec is unusable.
+            // FAIL CLOSED: dialing direct would put the connection on the clearnet, which is the
+            // exact thing the caller configured a proxy to avoid, and it would do so silently.
+            // down() reports the attempt as a failure against this endpoint, which is honest, from
+            // this node the endpoint really is unreachable, and it gives the UI its "no reach"
+            // signal instead of a pool that looks healthy while nothing ever connects.
+            Log.w(TAG, "relay dial refused: SOCKS proxy configured but unusable")
+            down()
+            return
+        }
         Log.i(TAG, "relay dial $candidate")
         // Capture the executor this connection belongs to. All of its OkHttp callbacks post here via
         // postTo(), so a callback racing stop() (or from this old connection after a restart onto a
