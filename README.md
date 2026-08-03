@@ -20,18 +20,19 @@
 Hop is a **delay-tolerant, end-to-end-encrypted mesh**: messages hop device to device over BLE, Wi-Fi,
 and the internet until they reach the person or service you meant. Held, never dropped.
 
-**Hop Bearers for Android is the transport layer.** Three independent Android library modules (BLE, LAN,
-cloud relay) each discover peers, form links, and shuttle application bytes, and each implements the
-same tiny `Bearer` / `LinkSink` contract from the Kotlin SDK. The bearer owns the radio and its own
-dedup; the core never sees a socket, and you pull in only the pipes you need.
+**Hop Bearers for Android is the transport layer.** Independent Android library modules (BLE, LAN, cloud
+relay, Meshtastic/LoRa) each discover peers, form links, and shuttle application bytes, and each
+implements the same tiny `Bearer` / `LinkSink` contract from the Kotlin SDK. The bearer owns the radio
+and its own dedup; the core never sees a socket, and you pull in only the pipes you need.
 
 ## What's in the box
 
 | Module          | Transport   | How it works                                                        |
 | --------------- | ----------- | ------------------------------------------------------------------- |
-| `bearer-ble`    | BLE         | GATT carries the PSM handshake, L2CAP carries data, iBeacon wakes the app |
-| `bearer-lan`    | Wi-Fi / LAN | NSD `_hoplan._tcp` discovery over TCP                               |
-| `bearer-relay`  | Internet    | one outbound WebSocket to a relay (OkHttp, no inbound port)         |
+| `bearer-ble`        | BLE         | GATT carries the PSM handshake, L2CAP carries data, iBeacon wakes the app |
+| `bearer-lan`        | Wi-Fi / LAN | NSD `_hoplan._tcp` discovery over TCP                               |
+| `bearer-relay`      | Internet    | one outbound WebSocket to a relay (OkHttp, no inbound port)         |
+| `bearer-meshtastic` | LoRa mesh   | relays through a connected Meshtastic radio: fragments frames into mesh packets on a private app port |
 
 ## Install
 
@@ -51,6 +52,7 @@ dependencies {
     implementation("sh.hop:hop-bearer-ble:0.0.2")
     implementation("sh.hop:hop-bearer-lan:0.0.2")
     implementation("sh.hop:hop-bearer-relay:0.0.2")
+    implementation("sh.hop:hop-bearer-meshtastic:0.0.2")
 }
 ```
 
@@ -70,14 +72,16 @@ import sh.hop.LinkSink
 import sh.hopme.bearers.ble.BleBearer
 import sh.hopme.bearers.lan.LanBearer
 import sh.hopme.bearers.relay.RelayBearer
+import sh.hopme.bearers.meshtastic.MeshtasticBearer
 import java.security.SecureRandom
 
 val myId = ByteArray(16).also { SecureRandom().nextBytes(it) }
 
 val mesh = BearerManager()
-mesh.register(BleBearer(context, myId))      // GATT PSM handshake, L2CAP data, iBeacon wake
-mesh.register(LanBearer(context, myId))      // NSD _hoplan._tcp + TCP
+mesh.register(BleBearer(context, myId))          // GATT PSM handshake, L2CAP data, iBeacon wake
+mesh.register(LanBearer(context, myId))          // NSD _hoplan._tcp + TCP
 mesh.register(RelayBearer("wss://relay.hopme.sh/"))
+mesh.register(MeshtasticBearer(context, myId))   // relay through a connected Meshtastic LoRa radio
 
 mesh.sink = myConsumer                         // gets linkUp / linkBytes / linkDown
 mesh.start()

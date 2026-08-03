@@ -6,7 +6,7 @@ dependencyResolutionManagement {
 }
 rootProject.name = "HopBearersAndroid"
 // The Kotlin SDK (sh.hop) as a JVM lib + one isolated module per Android bearer (mirrors bearers/apple).
-include(":hop-sdk", ":bearer-ble", ":bearer-lan", ":bearer-relay")
+include(":hop-sdk", ":bearer-ble", ":bearer-lan", ":bearer-relay", ":bearer-meshtastic")
 // The driver lives at drivers/android/hop-driver (north-star), built as part of this gradle build.
 //
 // Conditional for the same reason the hop-sdk shim is: that path is OUTSIDE `bearers/android`, the
