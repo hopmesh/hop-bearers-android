@@ -35,30 +35,29 @@ dedup; the core never sees a socket, and you pull in only the pipes you need.
 
 ## Install
 
-The modules publish as Android libraries (Maven / AAR). Point Gradle at the package repo and add the
-transports you want (`minSdk` 29, the floor for L2CAP CoC):
+Each bearer publishes its own AAR to Maven Central, so you add only the transports you want
+(`minSdk` 29, the floor for L2CAP CoC). No extra repository is needed:
 
 ```kotlin
 // settings.gradle.kts
 dependencyResolutionManagement {
-    repositories {
-        google(); mavenCentral()
-        maven("https://maven.pkg.github.com/hopmesh/hop-bearers-android")
-    }
+    repositories { google(); mavenCentral() }
 }
 ```
 
 ```kotlin
 // build.gradle.kts
 dependencies {
-    implementation("sh.hopme.bearers:bearer-ble:0.0.1")
-    implementation("sh.hopme.bearers:bearer-lan:0.0.1")
-    implementation("sh.hopme.bearers:bearer-relay:0.0.1")
+    implementation("sh.hop:hop-bearer-ble:0.0.2")
+    implementation("sh.hop:hop-bearer-lan:0.0.2")
+    implementation("sh.hop:hop-bearer-relay:0.0.2")
 }
 ```
 
-Each module depends only on the Kotlin SDK (`sh.hop`), which carries the `Bearer` / `LinkSink` / `HopRole`
-contract and the registry.
+Each bearer declares the Hop Android SDK (`sh.hop:hop`) as a dependency and pulls it in for you; that
+is what carries the `Bearer` / `LinkSink` / `HopRole` contract and the registry. Kotlin package names
+stay `sh.hopme.bearers.*`; only the Maven coordinates live under `sh.hop`, the namespace the SDK
+already publishes to.
 
 ## Usage
 

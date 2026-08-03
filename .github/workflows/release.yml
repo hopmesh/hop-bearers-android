@@ -1,0 +1,222 @@
+# Publish every Android bearer to Maven Central when a vX.Y.Z tag lands on this mirror.
+#
+# The Android bearers were mirrored here but never published: tools/release/plan.py only tags a
+# component that has this file, and hop-bearers-android had none, so every Apple bearer shipped while
+# the Android ones existed only as source. This is that file.
+#
+# Shaped like the other NON-NATIVE mirrors (sdk/node, bearers/apple): a build job with no environment,
+# then a `release`-environment publish job that verifies canonical provenance before it ships anything.
+# sdk/android needs a third job only because it carries signed libhop slices; a bearer is pure Kotlin
+# over the Android framework and ships no native code, so `release-provenance.py` runs WITHOUT
+# --require-native-artifacts and there is no native bundle to download, verify, or attest.
+# tools/release-provenance.test.sh pins this structure, including the single release environment.
+name: release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      release_artifact_name: ${{ steps.release-artifact.outputs.name }}
+      release_artifact_attempt: ${{ steps.release-artifact.outputs.run_attempt }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-java@0f481fcb613427c0f801b606911222b5b6f3083a # v5.5.0
+        with:
+          distribution: temurin
+          java-version: 17.0.19+10
+      - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+      - uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6.2.0
+        with:
+          gradle-version: '9.6.1'
+      - name: Build the exact Maven repository this tag describes
+        run: |
+          set -euo pipefail
+          # The tag must equal the version the build stamps into every POM. plan.py reads the same line
+          # to choose the tag, so a mismatch means someone tagged by hand; fail rather than publish a
+          # POM whose version disagrees with its own release.
+          declared="$(python3 -c 'import re; print(re.search(r"^version = \"([^\"]+)\"$", open("build.gradle.kts").read(), re.M).group(1))')"
+          test "v$declared" = "$GITHUB_REF_NAME" \
+            || { echo "tag $GITHUB_REF_NAME does not match declared version $declared"; exit 1; }
+          release="$RUNNER_TEMP/release"
+          mkdir -p "$release/maven"
+          # One shared Maven tree for every bearer. `publish` fans out over each bearer-* module via the
+          # publishing convention in build.gradle.kts, so a bearer added later is included with no edit
+          # here. -PhopMavenRepository points all of them at the same staging directory.
+          ./gradlew publish -PhopMavenRepository="$release/maven" --no-daemon --stacktrace
+          # Prove the tree is non-empty and that every published artifact carries the four files Central
+          # requires. A silently empty publish would otherwise sail through and release nothing, and a
+          # missing javadoc jar would fail at Sonatype validation after every file had already uploaded.
+          python3 - "$release/maven" "$declared" <<'PY'
+          import sys
+          from pathlib import Path
+
+          root, version = Path(sys.argv[1]), sys.argv[2]
+          modules = sorted(p for p in root.glob("sh/hop/*") if p.is_dir())
+          if not modules:
+              raise SystemExit("no Maven artifacts were published")
+          for module in modules:
+              directory = module / version
+              for suffix in (".aar", ".pom", "-sources.jar", "-javadoc.jar"):
+                  expected = directory / f"{module.name}-{version}{suffix}"
+                  if not expected.is_file():
+                      raise SystemExit(f"missing required Central artifact: {expected}")
+              print(f"validated {module.name} {version}")
+          PY
+          python3 .github/release-artifact.py create --directory "$release"
+      - name: Bind release artifact identity
+        id: release-artifact
+        run: |
+          echo "name=release-${GITHUB_SHA}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+          echo "run_attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.release-artifact.outputs.name }}
+          path: ${{ runner.temp }}/release/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    environment: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.build.outputs.release_artifact_name }}
+          path: ${{ runner.temp }}/release
+      - name: Mint canonical-source read token
+        id: source-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.HOP_SOURCE_APP_ID }}
+          private-key: ${{ secrets.HOP_SOURCE_APP_PRIVATE_KEY }}
+          owner: hopmesh
+          repositories: monorepo
+          permission-actions: read
+          permission-checks: read
+          permission-contents: read
+      - name: Verify canonical source, tag, tree, and CI
+        id: provenance
+        env:
+          SOURCE_TOKEN: ${{ steps.source-token.outputs.token }}
+        run: python3 .github/release-provenance.py --component hop-bearers-android --github-output "$GITHUB_OUTPUT"
+      - name: Verify immutable Maven repository
+        run: >-
+          python3 .github/release-artifact.py verify --directory "$RUNNER_TEMP/release"
+          --canonical-source-sha '${{ steps.provenance.outputs.source_sha }}'
+          --run-attempt '${{ needs.build.outputs.release_artifact_attempt }}'
+      - name: Attest every verified bearer AAR
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: ${{ runner.temp }}/release/maven/sh/hop/*/${{ steps.provenance.outputs.version }}/*.aar
+      - name: Sign and publish copies of verified Maven files
+        env:
+          MAVEN_USERNAME: ${{ secrets.MAVEN_USERNAME }}
+          MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
+          MAVEN_SIGNING_KEY: ${{ secrets.MAVEN_GPG_KEY }}
+          MAVEN_SIGNING_PASSWORD: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          # Name the credential that is missing rather than failing deep inside an upload with an
+          # HTTP error that mentions no secret (the blindness check-mirror-secrets.py exists for).
+          test -n "$MAVEN_USERNAME" || { echo "MAVEN_USERNAME is not seeded on this mirror"; exit 1; }
+          test -n "$MAVEN_PASSWORD" || { echo "MAVEN_PASSWORD is not seeded on this mirror"; exit 1; }
+          test -n "$MAVEN_SIGNING_KEY" || { echo "MAVEN_GPG_KEY is not seeded on this mirror"; exit 1; }
+          test -n "$MAVEN_SIGNING_PASSWORD" || { echo "MAVEN_GPG_PASSPHRASE is not seeded on this mirror"; exit 1; }
+          cp -R "$RUNNER_TEMP/release/maven" "$RUNNER_TEMP/publish-maven"
+          printf '%s\n' "$MAVEN_SIGNING_KEY" | gpg --batch --import
+          python3 - "$RUNNER_TEMP/publish-maven" <<'PY'
+          import base64
+          import hashlib
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          import urllib.parse
+          import urllib.request
+
+          root = Path(sys.argv[1])
+          primary = [
+              path for path in sorted(root.rglob("*"))
+              if path.is_file() and not path.name.endswith((".sha256", ".sha512", ".asc", ".md5", ".sha1"))
+          ]
+          for path in primary:
+              subprocess.run(
+                  ["gpg", "--batch", "--yes", "--pinentry-mode", "loopback",
+                   "--passphrase", os.environ["MAVEN_SIGNING_PASSWORD"],
+                   "--armor", "--detach-sign", str(path)],
+                  check=True,
+              )
+          for path in [item for item in sorted(root.rglob("*")) if item.is_file() and not item.name.endswith((".sha256", ".sha512"))]:
+              payload = path.read_bytes()
+              path.with_name(path.name + ".sha256").write_text(hashlib.sha256(payload).hexdigest() + "\n")
+              path.with_name(path.name + ".sha512").write_text(hashlib.sha512(payload).hexdigest() + "\n")
+
+          endpoint = "https://ossrh-staging-api.central.sonatype.com/service/local/staging/deploy/maven2/"
+          credential = base64.b64encode(
+              f"{os.environ['MAVEN_USERNAME']}:{os.environ['MAVEN_PASSWORD']}".encode()
+          ).decode()
+          for path in sorted(item for item in root.rglob("*") if item.is_file()):
+              relative = path.relative_to(root).as_posix()
+              url = endpoint + "/".join(urllib.parse.quote(part) for part in relative.split("/"))
+              request = urllib.request.Request(
+                  url,
+                  data=path.read_bytes(),
+                  method="PUT",
+                  headers={"Authorization": f"Basic {credential}"},
+              )
+              with urllib.request.urlopen(request, timeout=120) as response:
+                  if response.status not in (200, 201, 204):
+                      raise SystemExit(f"Maven upload failed for {relative}: HTTP {response.status}")
+              print(f"uploaded Maven file: {relative}")
+
+          finalize = urllib.request.Request(
+              "https://ossrh-staging-api.central.sonatype.com/manual/upload/defaultRepository/sh.hop?publishing_type=automatic",
+              data=b"",
+              method="POST",
+              headers={"Authorization": f"Bearer {credential}"},
+          )
+          with urllib.request.urlopen(finalize, timeout=120) as response:
+              if response.status not in (200, 201, 202, 204):
+                  raise SystemExit(f"Maven deployment finalization failed: HTTP {response.status}")
+              deployment = response.read().decode("utf-8", "replace").strip()
+          print(f"submitted Maven deployment: {deployment or 'accepted'}")
+          PY
+      - name: Collect the release assets
+        id: assets
+        run: |
+          set -euo pipefail
+          assets="$RUNNER_TEMP/assets"
+          mkdir -p "$assets"
+          # Every bearer's AAR and POM, whichever bearers this tag happened to build.
+          find "$RUNNER_TEMP/release/maven/sh/hop" -type f \( -name '*.aar' -o -name '*.pom' \) \
+            -exec cp {} "$assets"/ \;
+          cp "$RUNNER_TEMP/release/release-manifest.json" "$assets"/
+          ls -1 "$assets"
+      - name: Create the GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          generate_release_notes: true
+          files: ${{ runner.temp }}/assets/*
