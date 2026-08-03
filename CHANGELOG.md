@@ -5,6 +5,9 @@ git-cliff. Do not edit by hand.
 ## Unreleased
 
 ### Bug Fixes
+- point the bearer POMs at the SDK version that actually publishes (128e76a)
+- match the non-native mirror workflow shape the self-test pins (341b4ee)
+- run the Meshtastic bearer tests under Robolectric (31b5605)
 - make the PLAT-001 tests actually run, and correct what the last commit claimed (15065c8)
 - disabling a transport now actually stops it (PLAT-001) (7b84c71)
 - fmt drift, orphaned doc comments, and Android tests that raced the network (dc44ef4)
@@ -31,6 +34,7 @@ git-cliff. Do not edit by hand.
 - Kotlin 2.4/AGP 9.2.1/Compose BOM 2026.06/okhttp 5.4 toolchain migration (#90) (d4844bd)
 
 ### Documentation
+- regenerate from conventional commits (7a81fb6)
 - regenerate from conventional commits (e6b97f2)
 - regenerate from conventional commits (2741000)
 - regenerate from conventional commits (b96e019)
@@ -42,10 +46,16 @@ git-cliff. Do not edit by hand.
 - branded, marketable READMEs for every sub-repo (9c2a477)
 
 ### Features
+- add Meshtastic/LoRa bearer for iOS and Android (9335a6e)
 - finish inbound (import), drop export_pr (41c095e)
 - auto-generate monorepo + per-library changelogs (git-cliff) (8c64c37)
 
 ### Other
+- bump android and embedded to 0.0.5 for a taggable commit (fb6966a)
+- add the release workflow that makes the bearers publish (99d4317)
+- publish each bearer as sh.hop:hop-bearer-<transport> (b25227f)
+- declare the bearers' version so the tagger can see it (00dc696)
+- the same SOCKS hook on the Android relay bearer (ed4e9c5)
 - a stopped Android central revived itself from an in-flight scan callback (ea43289)
 - move the BLE socket write off the node's core thread (R-02) (41fd3fb)
 - cut the frame cap to the protocol's, and pin it (2a16945)
