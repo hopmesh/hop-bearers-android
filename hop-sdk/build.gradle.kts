@@ -25,6 +25,6 @@ dependencies {
         // Mirror build: re-expose the PUBLISHED Android SDK so `sh.hop` types resolve for compilation.
         // `api` so the bearers see the Bearer / LinkSink / HopRole contract transitively, exactly as
         // they do from the shared source in the monorepo.
-        api("sh.hop:hop:${rootProject.version}")
+        api("sh.hop:hop:${providers.gradleProperty("hopSdkVersion").get()}")
     }
 }

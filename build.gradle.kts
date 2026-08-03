@@ -17,6 +17,12 @@ plugins {
 version = "0.0.2"
 group = "sh.hop"
 
+// The PUBLISHED Hop Android SDK version every bearer depends on. Declared in gradle.properties (inside
+// the exported subtree, so the mirror build can read it) and INDEPENDENT of the bearers' own version:
+// the SDK is at 0.0.4 while the bearers are at 0.0.2, so deriving one from the other would publish POMs
+// pointing at a coordinate that does not exist. See the note in gradle.properties.
+val hopSdkVersion: String = providers.gradleProperty("hopSdkVersion").get()
+
 // ---- Publishing convention for every bearer module -------------------------------------------------
 //
 // Each bearer publishes its OWN AAR to Maven Central as `sh.hop:hop-bearer-<transport>`, so a consumer
@@ -153,7 +159,7 @@ subprojects {
                             configurations.getByName("implementation").allDependencies.forEach { dep ->
                                 if (dep is ProjectDependency) {
                                     if (dep.name == "hop-sdk") {
-                                        declare("sh.hop", "hop", rootProject.version.toString(), "aar")
+                                        declare("sh.hop", "hop", hopSdkVersion, "aar")
                                     }
                                     return@forEach
                                 }
