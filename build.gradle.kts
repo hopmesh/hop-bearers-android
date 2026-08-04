@@ -15,7 +15,12 @@ plugins {
 // anchor. Before this existed, hop-bearers-android had no release.yml at all, so plan.py skipped it and
 // the Android bearers were mirrored but never published, while every Apple counterpart shipped.
 version = "0.0.2"
-group = "sh.hop"
+// The bearers get their OWN namespace under the SDK's, so a transport is obviously a transport in a
+// dependency list rather than sitting flat beside `sh.hop:hop`. Maven Central verifies namespaces per
+// ROOT, and a subgroup of a verified namespace is covered by that verification, so `sh.hop.bearers`
+// needs no separate Central ownership proof. (That is what ruled out the READMEs' old
+// `sh.hopme.bearers`: hopme.sh is a DIFFERENT root domain and would have needed its own verification.)
+group = "sh.hop.bearers"
 
 // The PUBLISHED Hop Android SDK version every bearer depends on. Declared in gradle.properties (inside
 // the exported subtree, so the mirror build can read it) and INDEPENDENT of the bearers' own version:
@@ -55,9 +60,10 @@ subprojects {
     group = rootProject.group
     version = rootProject.version
 
-    // bearer-ble -> hop-bearer-ble. The `hop-` prefix keeps the artifact self-describing inside a flat
-    // Maven namespace shared with `sh.hop:hop`.
-    val artifact = "hop-$name"
+    // The gradle module name IS the artifact id: bearer-ble -> sh.hop.bearers:bearer-ble. The namespace
+    // already says "bearers", so no `hop-` prefix is needed to disambiguate, and the AAR on disk stays
+    // self-describing (bearer-ble-0.0.2.aar).
+    val artifact = name
     val transport = name.removePrefix("bearer-")
     // Display name only. Acronyms would otherwise render as "Hop Ble bearer" on Maven Central.
     val transportLabel = when (transport) {

@@ -65,7 +65,7 @@ jobs:
           from pathlib import Path
 
           root, version = Path(sys.argv[1]), sys.argv[2]
-          modules = sorted(p for p in root.glob("sh/hop/*") if p.is_dir())
+          modules = sorted(p for p in root.glob("sh/hop/bearers/*") if p.is_dir())
           if not modules:
               raise SystemExit("no Maven artifacts were published")
           for module in modules:
@@ -130,7 +130,7 @@ jobs:
       - name: Attest every verified bearer AAR
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
-          subject-path: ${{ runner.temp }}/release/maven/sh/hop/*/${{ steps.provenance.outputs.version }}/*.aar
+          subject-path: ${{ runner.temp }}/release/maven/sh/hop/bearers/*/${{ steps.provenance.outputs.version }}/*.aar
       - name: Sign and publish copies of verified Maven files
         env:
           MAVEN_USERNAME: ${{ secrets.MAVEN_USERNAME }}
@@ -193,7 +193,7 @@ jobs:
               print(f"uploaded Maven file: {relative}")
 
           finalize = urllib.request.Request(
-              "https://ossrh-staging-api.central.sonatype.com/manual/upload/defaultRepository/sh.hop?publishing_type=automatic",
+              "https://ossrh-staging-api.central.sonatype.com/manual/upload/defaultRepository/sh.hop.bearers?publishing_type=automatic",
               data=b"",
               method="POST",
               headers={"Authorization": f"Bearer {credential}"},
@@ -211,7 +211,7 @@ jobs:
           assets="$RUNNER_TEMP/assets"
           mkdir -p "$assets"
           # Every bearer's AAR and POM, whichever bearers this tag happened to build.
-          find "$RUNNER_TEMP/release/maven/sh/hop" -type f \( -name '*.aar' -o -name '*.pom' \) \
+          find "$RUNNER_TEMP/release/maven/sh/hop/bearers" -type f \( -name '*.aar' -o -name '*.pom' \) \
             -exec cp {} "$assets"/ \;
           cp "$RUNNER_TEMP/release/release-manifest.json" "$assets"/
           ls -1 "$assets"

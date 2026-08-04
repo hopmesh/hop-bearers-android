@@ -49,17 +49,17 @@ dependencyResolutionManagement {
 ```kotlin
 // build.gradle.kts
 dependencies {
-    implementation("sh.hop:hop-bearer-ble:0.0.2")
-    implementation("sh.hop:hop-bearer-lan:0.0.2")
-    implementation("sh.hop:hop-bearer-relay:0.0.2")
-    implementation("sh.hop:hop-bearer-meshtastic:0.0.2")
+    implementation("sh.hop.bearers:bearer-ble:0.0.2")
+    implementation("sh.hop.bearers:bearer-lan:0.0.2")
+    implementation("sh.hop.bearers:bearer-relay:0.0.2")
+    implementation("sh.hop.bearers:bearer-meshtastic:0.0.2")
 }
 ```
 
 Each bearer declares the Hop Android SDK (`sh.hop:hop`) as a dependency and pulls it in for you; that
-is what carries the `Bearer` / `LinkSink` / `HopRole` contract and the registry. Kotlin package names
-stay `sh.hopme.bearers.*`; only the Maven coordinates live under `sh.hop`, the namespace the SDK
-already publishes to.
+is what carries the `Bearer` / `LinkSink` / `HopRole` contract and the registry. The bearers publish
+under `sh.hop.bearers`, a subgroup of the SDK's own verified `sh.hop` namespace. Kotlin package names
+are unrelated to Maven coordinates and stay `sh.hopme.bearers.*`.
 
 ## Usage
 
