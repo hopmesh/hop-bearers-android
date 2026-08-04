@@ -34,6 +34,7 @@ git-cliff. Do not edit by hand.
 - Kotlin 2.4/AGP 9.2.1/Compose BOM 2026.06/okhttp 5.4 toolchain migration (#90) (d4844bd)
 
 ### Documentation
+- regenerate from conventional commits (e19ed95)
 - regenerate from conventional commits (7a81fb6)
 - regenerate from conventional commits (e6b97f2)
 - regenerate from conventional commits (2741000)
@@ -51,6 +52,7 @@ git-cliff. Do not edit by hand.
 - auto-generate monorepo + per-library changelogs (git-cliff) (8c64c37)
 
 ### Other
+- publish the bearers under sh.hop.bearers (06414bf)
 - bump android and embedded to 0.0.5 for a taggable commit (fb6966a)
 - add the release workflow that makes the bearers publish (99d4317)
 - publish each bearer as sh.hop:hop-bearer-<transport> (b25227f)
